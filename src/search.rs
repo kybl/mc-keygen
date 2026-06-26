@@ -375,24 +375,19 @@ fn spawn_cpu_worker(
         let mut local_count: u64 = 0;
 
         while !found.load(Ordering::Relaxed) {
-            // Stage CHAIN_BATCH points: batch_points[i] = point + i·8B.
-            // After the closure runs CHAIN_BATCH times, `next_point` ends up at
-            // point + CHAIN_BATCH·8B -- the base for the next iteration.
-            let mut next_point = point;
-            let batch_points: [EdwardsPoint; CHAIN_BATCH] = core::array::from_fn(|_| {
-                let cur = next_point;
-                next_point += eight_b;
-                cur
-            });
+            // Stage CHAIN_BATCH points: batch_points[i] = point + i·8B, with
+            // `next_point` = point + CHAIN_BATCH·8B as the next base. `chain`
+            // derives the niels form of 8B once instead of per link.
+            let (batch_points, next_point) = point.chain::<CHAIN_BATCH>(&eight_b);
 
-            // One inversion amortized across all CHAIN_BATCH points.
-            let compressed = EdwardsPoint::compress_batch::<CHAIN_BATCH>(&batch_points);
+            // One inversion amortized across all CHAIN_BATCH points; y-only,
+            // so the per-point sign multiply is skipped. The prefix check only
+            // reads the low bytes (byte 31's sign bit is out of reach), so the
+            // zeroed sign bit is fine here -- the true pubkey is recompressed
+            // on the rare hit below.
+            let compressed = EdwardsPoint::compress_batch_y_only::<CHAIN_BATCH>(&batch_points);
 
-            for (i, c) in compressed.iter().enumerate() {
-                // Borrow the encoded bytes instead of copying them out; the
-                // prefix check only reads the low bytes, and we only need an
-                // owned copy on the (rare) match path below.
-                let public_key = c.as_bytes();
+            for (i, public_key) in compressed.iter().enumerate() {
                 if should_skip(public_key) {
                     continue;
                 }
@@ -400,6 +395,10 @@ fn spawn_cpu_worker(
                 {
                     let mut match_scalar = scalar;
                     advance_scalar(&mut match_scalar, 8 * i as u64);
+
+                    // The scanned encoding has its sign bit zeroed; recompute
+                    // the true compressed pubkey (with sign) for this one hit.
+                    let public_key = batch_points[i].compress().to_bytes();
 
                     // Prefix half of the expanded private key is just fresh
                     // random bytes -- there's no derivation requirement on
@@ -415,7 +414,7 @@ fn spawn_cpu_worker(
                     found.store(true, Ordering::Relaxed);
                     *result.lock().unwrap() = Some(MatchResult {
                         keypair: MeshCoreKeypair {
-                            public_key: *public_key,
+                            public_key,
                             private_key,
                         },
                         matched_prefix: matched.0.clone(),
@@ -612,5 +611,32 @@ mod tests {
             hex::encode_upper(scalar),
             result.public_key
         );
+    }
+
+    /// The hot loop scans `compress_batch_y_only` (sign bit zeroed) but the
+    /// prefix matcher only reads the low bytes, and the real pubkey is
+    /// recompressed on a hit. Guard the fork invariant: y-only must equal the
+    /// canonical compression on every byte except the sign bit of byte 31.
+    #[test]
+    fn compress_batch_y_only_matches_canonical() {
+        let pts: [EdwardsPoint; 4] =
+            core::array::from_fn(|i| EdwardsPoint::mul_base_clamped({
+                let mut s = [0u8; 32];
+                s[0] = (i as u8) * 40 + 9;
+                s[8] = 0x5a;
+                clamp_scalar(&mut s);
+                s
+            }));
+        let y_only = EdwardsPoint::compress_batch_y_only::<4>(&pts);
+        for (i, p) in pts.iter().enumerate() {
+            let full = p.compress().to_bytes();
+            assert_eq!(&y_only[i][..31], &full[..31], "low bytes differ at {i}");
+            assert_eq!(y_only[i][31] & 0x80, 0, "sign bit not cleared at {i}");
+            assert_eq!(
+                y_only[i][31] & 0x7f,
+                full[31] & 0x7f,
+                "non-sign bits of byte 31 differ at {i}"
+            );
+        }
     }
 }

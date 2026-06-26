@@ -236,17 +236,13 @@ fn spawn_cpu_bench_worker(
         let mut local_matches: u64 = 0;
 
         while !stop.load(Ordering::Relaxed) {
-            let mut next_point = point;
-            let batch_points: [EdwardsPoint; CHAIN_BATCH] = core::array::from_fn(|_| {
-                let cur = next_point;
-                next_point += eight_b;
-                cur
-            });
+            // Mirror the real search hot loop: niels-chained +8B staging and
+            // y-only batch compression (sign multiply skipped).
+            let (batch_points, next_point) = point.chain::<CHAIN_BATCH>(&eight_b);
 
-            let compressed = EdwardsPoint::compress_batch::<CHAIN_BATCH>(&batch_points);
+            let compressed = EdwardsPoint::compress_batch_y_only::<CHAIN_BATCH>(&batch_points);
 
-            for c in compressed.iter() {
-                let public_key = c.as_bytes();
+            for public_key in compressed.iter() {
                 if public_key[0] == 0x00 || public_key[0] == 0xFF {
                     continue;
                 }

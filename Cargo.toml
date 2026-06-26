@@ -29,6 +29,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 cudarc = { version = "0.19", optional = true, features = ["cuda-13010"] }
 metal = { version = "0.30", optional = true }
 
+[patch.crates-io]
+# Vendored fork adding y-only batch compression and a precomputed-niels +step
+# chain to the Ed25519 hot loop. See third_party/curve25519-dalek.
+curve25519-dalek = { path = "third_party/curve25519-dalek" }
+
 [build-dependencies]
 vergen-gix = "1"
 
