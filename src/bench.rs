@@ -27,7 +27,7 @@ const SCHEMA_VERSION: u32 = 2;
 /// Number of points compressed under one batched inversion. Mirrors
 /// `CHAIN_BATCH` in src/search.rs so the bench worker measures the same hot
 /// loop the real search uses.
-const CHAIN_BATCH: usize = 16;
+const CHAIN_BATCH: usize = 256;
 
 /// Per-worker flush threshold for atomic counter updates. Keeping it batched
 /// avoids dominating the loop with cache-line contention at >1 MH/s.
@@ -246,11 +246,11 @@ fn spawn_cpu_bench_worker(
             let compressed = EdwardsPoint::compress_batch::<CHAIN_BATCH>(&batch_points);
 
             for c in compressed.iter() {
-                let public_key = c.to_bytes();
+                let public_key = c.as_bytes();
                 if public_key[0] == 0x00 || public_key[0] == 0xFF {
                     continue;
                 }
-                if matchers.iter().any(|m| m.matches(&public_key)) {
+                if matchers.iter().any(|m| m.matches(public_key)) {
                     local_matches += 1;
                 }
             }
