@@ -673,6 +673,17 @@ impl EdwardsPoint {
         (out, cur)
     }
 
+    /// Test-only oracle: GF(2^255 - 19) multiply via the reference field,
+    /// exposed so a separate SIMD field implementation can be validated
+    /// against it. The high bit of each input is ignored (as in `from_bytes`).
+    /// Not part of the stable public API.
+    #[doc(hidden)]
+    pub fn field_mul_reference(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+        let fa = FieldElement::from_bytes(a);
+        let fb = FieldElement::from_bytes(b);
+        (&fa * &fb).to_bytes()
+    }
+
     /// Compress several `EdwardsPoint`s into `CompressedEdwardsY` format, using a batch inversion
     /// for a significant speedup.
     #[cfg(feature = "alloc")]

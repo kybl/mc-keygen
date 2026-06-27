@@ -5,6 +5,7 @@ compile_error!("feature `gpu` requires a backend; enable `cuda` or `metal`");
 
 pub mod keygen;
 pub mod search;
+pub mod simd4;
 pub mod types;
 
 #[cfg(feature = "cuda")]
