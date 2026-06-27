@@ -236,11 +236,10 @@ fn spawn_cpu_bench_worker(
         let mut local_matches: u64 = 0;
 
         while !stop.load(Ordering::Relaxed) {
-            // Mirror the real search hot loop: niels-chained +8B staging and
-            // y-only batch compression (sign multiply skipped).
-            let (batch_points, next_point) = point.chain::<CHAIN_BATCH>(&eight_b);
-
-            let compressed = EdwardsPoint::compress_batch_y_only::<CHAIN_BATCH>(&batch_points);
+            // Mirror the real search hot loop: fused niels-chained +8B walk
+            // and y-only batch compression (sign multiply skipped, X/T dropped).
+            let (compressed, next_point) =
+                point.chain_compress_y_only::<CHAIN_BATCH>(&eight_b);
 
             for public_key in compressed.iter() {
                 if public_key[0] == 0x00 || public_key[0] == 0xFF {

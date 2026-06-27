@@ -375,17 +375,16 @@ fn spawn_cpu_worker(
         let mut local_count: u64 = 0;
 
         while !found.load(Ordering::Relaxed) {
-            // Stage CHAIN_BATCH points: batch_points[i] = point + i·8B, with
-            // `next_point` = point + CHAIN_BATCH·8B as the next base. `chain`
-            // derives the niels form of 8B once instead of per link.
-            let (batch_points, next_point) = point.chain::<CHAIN_BATCH>(&eight_b);
-
-            // One inversion amortized across all CHAIN_BATCH points; y-only,
-            // so the per-point sign multiply is skipped. The prefix check only
-            // reads the low bytes (byte 31's sign bit is out of reach), so the
-            // zeroed sign bit is fine here -- the true pubkey is recompressed
-            // on the rare hit below.
-            let compressed = EdwardsPoint::compress_batch_y_only::<CHAIN_BATCH>(&batch_points);
+            // Walk batch_points[i] = point + i·8B and y-only-compress them in
+            // one fused pass: the niels form of 8B is derived once, only (Y,Z)
+            // per point is kept (X/T dropped), the per-point sign multiply is
+            // skipped, and one inversion is amortized across the batch.
+            // `next_point` = point + CHAIN_BATCH·8B is the next base. The prefix
+            // check reads only the low bytes (byte 31's sign bit is out of
+            // reach), so the zeroed sign bit is fine -- the true pubkey is
+            // recompressed on the rare hit below.
+            let (compressed, next_point) =
+                point.chain_compress_y_only::<CHAIN_BATCH>(&eight_b);
 
             for (i, public_key) in compressed.iter().enumerate() {
                 if should_skip(public_key) {
@@ -396,9 +395,14 @@ fn spawn_cpu_worker(
                     let mut match_scalar = scalar;
                     advance_scalar(&mut match_scalar, 8 * i as u64);
 
-                    // The scanned encoding has its sign bit zeroed; recompute
-                    // the true compressed pubkey (with sign) for this one hit.
-                    let public_key = batch_points[i].compress().to_bytes();
+                    // The scanned encoding has its sign bit zeroed and the full
+                    // points weren't kept; recompute this one point (point +
+                    // i·8B) and compress it properly (with sign) for the hit.
+                    let mut hit_point = point;
+                    for _ in 0..i {
+                        hit_point += eight_b;
+                    }
+                    let public_key = hit_point.compress().to_bytes();
 
                     // Prefix half of the expanded private key is just fresh
                     // random bytes -- there's no derivation requirement on

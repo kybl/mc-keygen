@@ -644,21 +644,33 @@ impl EdwardsPoint {
         })
     }
 
-    /// Produce the chain `self + i·step` for `i` in `0..N`, plus the next base
-    /// `self + N·step`. The niels representation of `step` is derived once and
-    /// reused, so each link is a mixed addition that avoids re-deriving niels
-    /// coordinates (one field mul saved per link versus repeated
-    /// `EdwardsPoint + EdwardsPoint`). Useful for fixed-step walks such as the
-    /// `+8B` vanity search.
-    pub fn chain<const N: usize>(&self, step: &EdwardsPoint) -> ([EdwardsPoint; N], EdwardsPoint) {
+    /// Fused fixed-step walk + [`compress_batch_y_only`] that never
+    /// materializes the full chain in memory. Walks `self + i·step` for `i` in
+    /// `0..N`, deriving the niels form of `step` once (one field mul saved per
+    /// link versus repeated `EdwardsPoint + EdwardsPoint`, which re-derives it
+    /// every time) and keeping only each point's `(Y, Z)` — `X`/`T` stay in
+    /// registers and are dropped — so the working set is half the size of
+    /// staging `[EdwardsPoint; N]` (~80 B/point) before compression, which is
+    /// friendlier to L1/L2 at large `N`. Returns the y-only encodings (sign bit
+    /// zero) and the next base `self + N·step`. Recover a true signed encoding
+    /// for a hit by recompressing the point, or via
+    /// [`EdwardsPoint::mul_base_clamped`] on its scalar.
+    pub fn chain_compress_y_only<const N: usize>(
+        &self,
+        step: &EdwardsPoint,
+    ) -> ([[u8; 32]; N], EdwardsPoint) {
         let step_niels = step.as_projective_niels();
+        let mut ys = [FieldElement::ZERO; N];
+        let mut zs = [FieldElement::ZERO; N];
         let mut cur = *self;
-        let points = core::array::from_fn(|_| {
-            let out = cur;
+        for i in 0..N {
+            ys[i] = cur.Y;
+            zs[i] = cur.Z;
             cur = (&cur + &step_niels).as_extended();
-            out
-        });
-        (points, cur)
+        }
+        FieldElement::invert_batch(&mut zs);
+        let out = core::array::from_fn(|i| (&ys[i] * &zs[i]).to_bytes());
+        (out, cur)
     }
 
     /// Compress several `EdwardsPoint`s into `CompressedEdwardsY` format, using a batch inversion

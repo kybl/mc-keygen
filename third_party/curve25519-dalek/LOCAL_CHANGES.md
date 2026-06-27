@@ -11,10 +11,13 @@ The **only** local change is two added public methods on `EdwardsPoint`
   key). The prefix scan only reads the low bytes; the true signed pubkey is
   recomputed with `compress()` on the rare hit.
 
-- `chain<const N>(&self, step) -> ([EdwardsPoint; N], EdwardsPoint)`
-  Produces `self + i·step` for `i in 0..N` plus the next base, deriving the
-  niels form of `step` once instead of per link (one field mul saved per key
-  versus repeated `EdwardsPoint + EdwardsPoint`).
+- `chain_compress_y_only<const N>(&self, step) -> ([[u8; 32]; N], EdwardsPoint)`
+  Fused fixed-step walk + y-only compression. Walks `self + i·step`, derives
+  the niels form of `step` once (one field mul saved per link versus repeated
+  `EdwardsPoint + EdwardsPoint`), and keeps only each point's `(Y, Z)` so the
+  pre-compression working set is half the size of an `[EdwardsPoint; N]`
+  staging buffer — friendlier to L1/L2. This is the method the hot loop calls;
+  `compress_batch_y_only` is retained as a standalone and for the invariant test.
 
 Both are guarded by the `compress_batch_y_only_matches_canonical` and
 `search_handle_scalar_matches_pubkey` tests in the parent crate.
