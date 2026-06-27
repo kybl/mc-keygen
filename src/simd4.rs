@@ -448,9 +448,54 @@ pub mod avx2 {
 
     #[inline]
     #[target_feature(enable = "avx2")]
+    unsafe fn mc(x: __m256i, c: i64) -> __m256i {
+        _mm256_mul_epi32(x, _mm256_set1_epi64x(c))
+    }
+
+    /// `h = f^2` (ref10 `fe_sq`, 4-wide). Exploits symmetry to roughly halve
+    /// the limb products versus `mul4(f, f)`; used heavily by `invert4`.
+    #[target_feature(enable = "avx2")]
     pub unsafe fn sq4(f: &Fe4) -> Fe4 {
-        // A dedicated squaring saves muls; correctness-first uses mul4(x, x).
-        mul4(f, f)
+        let l = &f.l;
+        let (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9) =
+            (l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7], l[8], l[9]);
+        let p = |a, b| _mm256_mul_epi32(a, b);
+        let add = |a, b| _mm256_add_epi64(a, b);
+        let dbl = |a| _mm256_add_epi64(a, a);
+
+        let f0_2 = dbl(f0);
+        let f1_2 = dbl(f1);
+        let f2_2 = dbl(f2);
+        let f3_2 = dbl(f3);
+        let f4_2 = dbl(f4);
+        let f5_2 = dbl(f5);
+        let f6_2 = dbl(f6);
+        let f7_2 = dbl(f7);
+        let f5_38 = mc(f5, 38);
+        let f6_19 = mc(f6, 19);
+        let f7_38 = mc(f7, 38);
+        let f8_19 = mc(f8, 19);
+        let f9_38 = mc(f9, 38);
+
+        macro_rules! sum {
+            ($($x:expr),+ $(,)?) => {{ let mut a = _mm256_setzero_si256(); $(a = add(a, $x);)+ a }};
+        }
+
+        let mut h = [
+            sum!(p(f0, f0), p(f1_2, f9_38), p(f2_2, f8_19), p(f3_2, f7_38), p(f4_2, f6_19), p(f5, f5_38)),
+            sum!(p(f0_2, f1), p(f2, f9_38), p(f3_2, f8_19), p(f4, f7_38), p(f5_2, f6_19)),
+            sum!(p(f0_2, f2), p(f1_2, f1), p(f3_2, f9_38), p(f4_2, f8_19), p(f5_2, f7_38), p(f6, f6_19)),
+            sum!(p(f0_2, f3), p(f1_2, f2), p(f4, f9_38), p(f5_2, f8_19), p(f6, f7_38)),
+            sum!(p(f0_2, f4), p(f1_2, f3_2), p(f2, f2), p(f5_2, f9_38), p(f6_2, f8_19), p(f7, f7_38)),
+            sum!(p(f0_2, f5), p(f1_2, f4), p(f2_2, f3), p(f6, f9_38), p(f7_2, f8_19)),
+            sum!(p(f0_2, f6), p(f1_2, f5_2), p(f2_2, f4), p(f3_2, f3), p(f7_2, f9_38), p(f8, f8_19)),
+            sum!(p(f0_2, f7), p(f1_2, f6), p(f2_2, f5), p(f3_2, f4), p(f8, f9_38)),
+            sum!(p(f0_2, f8), p(f1_2, f7_2), p(f2_2, f6), p(f3_2, f5_2), p(f4, f4), p(f9, f9_38)),
+            sum!(p(f0_2, f9), p(f1_2, f8), p(f2_2, f7), p(f3_2, f6), p(f4_2, f5)),
+        ];
+
+        carry4(&mut h);
+        Fe4 { l: h }
     }
 
     /// A point in extended coordinates, four keys deep.
@@ -672,6 +717,26 @@ mod tests {
                 let got = fe_tobytes(&prod[k]);
                 let want = EdwardsPoint::field_mul_reference(&ab[k], &bb[k]);
                 assert_eq!(got, want, "mul4 lane {k} disagrees with dalek");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd_sq4_matches_mul4() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut st = 0x2468_ace0_1357_bdf9;
+        for _ in 0..500 {
+            let xb: [[u8; 32]; 4] = core::array::from_fn(|_| rand_fe_bytes(&mut st));
+            let xf: [Fe; 4] = core::array::from_fn(|k| fe_frombytes(&xb[k]));
+            let (sq, mm) = unsafe {
+                let x = avx2::load4(&xf);
+                (avx2::store4(&avx2::sq4(&x)), avx2::store4(&avx2::mul4(&x, &x)))
+            };
+            for k in 0..4 {
+                assert_eq!(fe_tobytes(&sq[k]), fe_tobytes(&mm[k]), "sq4 != mul4(x,x) lane {k}");
             }
         }
     }
