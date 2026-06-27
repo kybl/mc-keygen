@@ -227,6 +227,11 @@ fn spawn_cpu_bench_worker(
     thread::spawn(move || {
         #[cfg(target_arch = "x86_64")]
         {
+            if CHAIN_BATCH % 8 == 0 && std::is_x86_feature_detected!("avx512f") {
+                // SAFETY: guarded by the runtime avx512f check.
+                unsafe { bench_worker_simd512(&matchers, &stop, &keys, &matches) };
+                return;
+            }
             if CHAIN_BATCH % 4 == 0 && std::is_x86_feature_detected!("avx2") {
                 // SAFETY: guarded by the runtime avx2 check.
                 unsafe { bench_worker_simd(&matchers, &stop, &keys, &matches) };
@@ -325,6 +330,72 @@ unsafe fn bench_worker_simd(
 
         for s in 0..K {
             for lane in 0..4 {
+                let public_key = &out[s][lane];
+                if public_key[0] == 0x00 || public_key[0] == 0xFF {
+                    continue;
+                }
+                if matchers.iter().any(|m| m.matches(public_key)) {
+                    local_matches += 1;
+                }
+            }
+        }
+
+        local_keys += CHAIN_BATCH as u64;
+        if local_keys >= FLUSH_EVERY {
+            keys.fetch_add(local_keys, Ordering::Relaxed);
+            if local_matches > 0 {
+                matches.fetch_add(local_matches, Ordering::Relaxed);
+                local_matches = 0;
+            }
+            local_keys = 0;
+        }
+    }
+
+    keys.fetch_add(local_keys, Ordering::Relaxed);
+    if local_matches > 0 {
+        matches.fetch_add(local_matches, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn bench_worker_simd512(
+    matchers: &[PrefixMatcher],
+    stop: &AtomicBool,
+    keys: &AtomicU64,
+    matches: &AtomicU64,
+) {
+    use crate::simd4::{avx512, fe_frombytes};
+
+    const K: usize = CHAIN_BATCH / 8;
+
+    let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
+    let niels = avx512::niels8_from_bytes(&eight_b.niels_bytes());
+
+    let mut scalars = [[0u8; 32]; 8];
+    for l in 0..8 {
+        OsRng.fill_bytes(&mut scalars[l]);
+        clamp_scalar(&mut scalars[l]);
+    }
+    let starts: [EdwardsPoint; 8] =
+        core::array::from_fn(|l| EdwardsPoint::mul_base_clamped(scalars[l]));
+    let xyzt: [_; 8] = core::array::from_fn(|l| starts[l].xyzt_bytes());
+    let mut p8 = avx512::point8_from_xyzt(
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][0])),
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][1])),
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][2])),
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][3])),
+    );
+
+    let mut out: Box<[[[u8; 32]; 8]; K]> = Box::new([[[0u8; 32]; 8]; K]);
+    let mut local_keys: u64 = 0;
+    let mut local_matches: u64 = 0;
+
+    while !stop.load(Ordering::Relaxed) {
+        p8 = avx512::chain_y_only::<K>(p8, &niels, &mut out);
+
+        for s in 0..K {
+            for lane in 0..8 {
                 let public_key = &out[s][lane];
                 if public_key[0] == 0x00 || public_key[0] == 0xFF {
                     continue;

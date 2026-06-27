@@ -367,6 +367,11 @@ fn spawn_cpu_worker(
         // chain otherwise.
         #[cfg(target_arch = "x86_64")]
         {
+            if CHAIN_BATCH % 8 == 0 && std::is_x86_feature_detected!("avx512f") {
+                // SAFETY: guarded by the runtime avx512f check.
+                unsafe { cpu_worker_simd512(&matchers, &found, &attempts, &result) };
+                return;
+            }
             if CHAIN_BATCH % 4 == 0 && std::is_x86_feature_detected!("avx2") {
                 // SAFETY: guarded by the runtime avx2 check above.
                 unsafe { cpu_worker_simd(&matchers, &found, &attempts, &result) };
@@ -526,6 +531,83 @@ unsafe fn cpu_worker_simd(
         }
         // Advance scalars and dalek start points in lockstep with p4.
         for l in 0..4 {
+            advance_scalar(&mut scalars[l], 8 * K as u64);
+            starts[l] += big_step;
+        }
+    }
+
+    attempts.fetch_add(local_count, Ordering::Relaxed);
+}
+
+/// AVX-512 worker: eight independent `+8B` chains in 8 SIMD lanes. Same shape
+/// as [`cpu_worker_simd`], doubled lane count.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn cpu_worker_simd512(
+    matchers: &[(String, PrefixMatcher)],
+    found: &AtomicBool,
+    attempts: &AtomicU64,
+    result: &Mutex<Option<MatchResult>>,
+) {
+    use crate::simd4::{avx512, fe_frombytes};
+
+    const K: usize = CHAIN_BATCH / 8;
+
+    let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
+    let big_step = ED25519_BASEPOINT_TABLE * &Scalar::from((8 * K) as u64);
+    let niels = avx512::niels8_from_bytes(&eight_b.niels_bytes());
+
+    let mut scalars = [[0u8; 32]; 8];
+    for l in 0..8 {
+        OsRng.fill_bytes(&mut scalars[l]);
+        clamp_scalar(&mut scalars[l]);
+    }
+    let mut starts: [EdwardsPoint; 8] =
+        core::array::from_fn(|l| EdwardsPoint::mul_base_clamped(scalars[l]));
+    let xyzt: [_; 8] = core::array::from_fn(|l| starts[l].xyzt_bytes());
+    let mut p8 = avx512::point8_from_xyzt(
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][0])),
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][1])),
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][2])),
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][3])),
+    );
+
+    let mut out: Box<[[[u8; 32]; 8]; K]> = Box::new([[[0u8; 32]; 8]; K]);
+    let mut local_count: u64 = 0;
+
+    while !found.load(Ordering::Relaxed) {
+        p8 = avx512::chain_y_only::<K>(p8, &niels, &mut out);
+
+        for s in 0..K {
+            for lane in 0..8 {
+                let public_key = &out[s][lane];
+                if should_skip(public_key) {
+                    continue;
+                }
+                if let Some(matched) = matchers.iter().find(|(_, m)| m.matches(public_key)) {
+                    let mut match_scalar = scalars[lane];
+                    advance_scalar(&mut match_scalar, 8 * s as u64);
+                    let mut hit = starts[lane];
+                    for _ in 0..s {
+                        hit += eight_b;
+                    }
+                    let public_key = hit.compress().to_bytes();
+                    attempts.fetch_add(
+                        local_count + (s * 8 + lane) as u64 + 1,
+                        Ordering::Relaxed,
+                    );
+                    record_match(matched.0.clone(), public_key, match_scalar, found, result);
+                    return;
+                }
+            }
+        }
+
+        local_count += CHAIN_BATCH as u64;
+        if local_count >= BATCH_SIZE {
+            attempts.fetch_add(local_count, Ordering::Relaxed);
+            local_count = 0;
+        }
+        for l in 0..8 {
             advance_scalar(&mut scalars[l], 8 * K as u64);
             starts[l] += big_step;
         }

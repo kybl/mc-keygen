@@ -665,6 +665,364 @@ pub mod avx2 {
     }
 }
 
+// =====================================================================
+// AVX-512 8-wide (8 independent keys per call). Same radix-2^25.5 math as
+// the AVX2 path, doubled lane count; `_mm512_srai_epi64` is native so the
+// carry needs no emulation. Kept only if it actually beats AVX2 at runtime.
+// =====================================================================
+
+#[cfg(target_arch = "x86_64")]
+pub mod avx512 {
+    use super::Fe;
+    use core::arch::x86_64::*;
+
+    #[derive(Clone, Copy)]
+    pub struct Fe8 {
+        pub l: [__m512i; 10],
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn m19(x: __m512i) -> __m512i {
+        _mm512_mul_epi32(x, _mm512_set1_epi64(19))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn mc(x: __m512i, c: i64) -> __m512i {
+        _mm512_mul_epi32(x, _mm512_set1_epi64(c))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn carry8(h: &mut [__m512i; 10]) {
+        let r25 = _mm512_set1_epi64(1 << 25);
+        let r24 = _mm512_set1_epi64(1 << 24);
+        macro_rules! ce {
+            ($i:expr, $j:expr) => {{
+                let c = _mm512_srai_epi64(_mm512_add_epi64(h[$i], r25), 26);
+                h[$j] = _mm512_add_epi64(h[$j], c);
+                h[$i] = _mm512_sub_epi64(h[$i], _mm512_slli_epi64(c, 26));
+            }};
+        }
+        macro_rules! co {
+            ($i:expr, $j:expr) => {{
+                let c = _mm512_srai_epi64(_mm512_add_epi64(h[$i], r24), 25);
+                h[$j] = _mm512_add_epi64(h[$j], c);
+                h[$i] = _mm512_sub_epi64(h[$i], _mm512_slli_epi64(c, 25));
+            }};
+        }
+        ce!(0, 1);
+        ce!(4, 5);
+        co!(1, 2);
+        co!(5, 6);
+        ce!(2, 3);
+        ce!(6, 7);
+        co!(3, 4);
+        co!(7, 8);
+        ce!(4, 5);
+        ce!(8, 9);
+        let c9 = _mm512_srai_epi64(_mm512_add_epi64(h[9], r24), 25);
+        h[0] = _mm512_add_epi64(h[0], m19(c9));
+        h[9] = _mm512_sub_epi64(h[9], _mm512_slli_epi64(c9, 25));
+        ce!(0, 1);
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn mul8(f: &Fe8, g: &Fe8) -> Fe8 {
+        let fl = &f.l;
+        let gl = &g.l;
+        let g1_19 = m19(gl[1]);
+        let g2_19 = m19(gl[2]);
+        let g3_19 = m19(gl[3]);
+        let g4_19 = m19(gl[4]);
+        let g5_19 = m19(gl[5]);
+        let g6_19 = m19(gl[6]);
+        let g7_19 = m19(gl[7]);
+        let g8_19 = m19(gl[8]);
+        let g9_19 = m19(gl[9]);
+        let f1_2 = _mm512_add_epi64(fl[1], fl[1]);
+        let f3_2 = _mm512_add_epi64(fl[3], fl[3]);
+        let f5_2 = _mm512_add_epi64(fl[5], fl[5]);
+        let f7_2 = _mm512_add_epi64(fl[7], fl[7]);
+        let f9_2 = _mm512_add_epi64(fl[9], fl[9]);
+        let p = |a, b| _mm512_mul_epi32(a, b);
+        let add = |a, b| _mm512_add_epi64(a, b);
+        macro_rules! sum {
+            ($($x:expr),+ $(,)?) => {{ let mut a = _mm512_setzero_si512(); $(a = add(a, $x);)+ a }};
+        }
+        let (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9) =
+            (fl[0], fl[1], fl[2], fl[3], fl[4], fl[5], fl[6], fl[7], fl[8], fl[9]);
+        let (g0, g1, g2, g3, g4, g5, g6, g7, g8, g9) =
+            (gl[0], gl[1], gl[2], gl[3], gl[4], gl[5], gl[6], gl[7], gl[8], gl[9]);
+        let mut h = [
+            sum!(p(f0, g0), p(f1_2, g9_19), p(f2, g8_19), p(f3_2, g7_19), p(f4, g6_19),
+                 p(f5_2, g5_19), p(f6, g4_19), p(f7_2, g3_19), p(f8, g2_19), p(f9_2, g1_19)),
+            sum!(p(f0, g1), p(f1, g0), p(f2, g9_19), p(f3, g8_19), p(f4, g7_19),
+                 p(f5, g6_19), p(f6, g5_19), p(f7, g4_19), p(f8, g3_19), p(f9, g2_19)),
+            sum!(p(f0, g2), p(f1_2, g1), p(f2, g0), p(f3_2, g9_19), p(f4, g8_19),
+                 p(f5_2, g7_19), p(f6, g6_19), p(f7_2, g5_19), p(f8, g4_19), p(f9_2, g3_19)),
+            sum!(p(f0, g3), p(f1, g2), p(f2, g1), p(f3, g0), p(f4, g9_19),
+                 p(f5, g8_19), p(f6, g7_19), p(f7, g6_19), p(f8, g5_19), p(f9, g4_19)),
+            sum!(p(f0, g4), p(f1_2, g3), p(f2, g2), p(f3_2, g1), p(f4, g0),
+                 p(f5_2, g9_19), p(f6, g8_19), p(f7_2, g7_19), p(f8, g6_19), p(f9_2, g5_19)),
+            sum!(p(f0, g5), p(f1, g4), p(f2, g3), p(f3, g2), p(f4, g1),
+                 p(f5, g0), p(f6, g9_19), p(f7, g8_19), p(f8, g7_19), p(f9, g6_19)),
+            sum!(p(f0, g6), p(f1_2, g5), p(f2, g4), p(f3_2, g3), p(f4, g2),
+                 p(f5_2, g1), p(f6, g0), p(f7_2, g9_19), p(f8, g8_19), p(f9_2, g7_19)),
+            sum!(p(f0, g7), p(f1, g6), p(f2, g5), p(f3, g4), p(f4, g3),
+                 p(f5, g2), p(f6, g1), p(f7, g0), p(f8, g9_19), p(f9, g8_19)),
+            sum!(p(f0, g8), p(f1_2, g7), p(f2, g6), p(f3_2, g5), p(f4, g4),
+                 p(f5_2, g3), p(f6, g2), p(f7_2, g1), p(f8, g0), p(f9_2, g9_19)),
+            sum!(p(f0, g9), p(f1, g8), p(f2, g7), p(f3, g6), p(f4, g5),
+                 p(f5, g4), p(f6, g3), p(f7, g2), p(f8, g1), p(f9, g0)),
+        ];
+        carry8(&mut h);
+        Fe8 { l: h }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn sq8(f: &Fe8) -> Fe8 {
+        let l = &f.l;
+        let (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9) =
+            (l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7], l[8], l[9]);
+        let p = |a, b| _mm512_mul_epi32(a, b);
+        let add = |a, b| _mm512_add_epi64(a, b);
+        let dbl = |a| _mm512_add_epi64(a, a);
+        let f0_2 = dbl(f0);
+        let f1_2 = dbl(f1);
+        let f2_2 = dbl(f2);
+        let f3_2 = dbl(f3);
+        let f4_2 = dbl(f4);
+        let f5_2 = dbl(f5);
+        let f6_2 = dbl(f6);
+        let f7_2 = dbl(f7);
+        let f5_38 = mc(f5, 38);
+        let f6_19 = mc(f6, 19);
+        let f7_38 = mc(f7, 38);
+        let f8_19 = mc(f8, 19);
+        let f9_38 = mc(f9, 38);
+        macro_rules! sum {
+            ($($x:expr),+ $(,)?) => {{ let mut a = _mm512_setzero_si512(); $(a = add(a, $x);)+ a }};
+        }
+        let mut h = [
+            sum!(p(f0, f0), p(f1_2, f9_38), p(f2_2, f8_19), p(f3_2, f7_38), p(f4_2, f6_19), p(f5, f5_38)),
+            sum!(p(f0_2, f1), p(f2, f9_38), p(f3_2, f8_19), p(f4, f7_38), p(f5_2, f6_19)),
+            sum!(p(f0_2, f2), p(f1_2, f1), p(f3_2, f9_38), p(f4_2, f8_19), p(f5_2, f7_38), p(f6, f6_19)),
+            sum!(p(f0_2, f3), p(f1_2, f2), p(f4, f9_38), p(f5_2, f8_19), p(f6, f7_38)),
+            sum!(p(f0_2, f4), p(f1_2, f3_2), p(f2, f2), p(f5_2, f9_38), p(f6_2, f8_19), p(f7, f7_38)),
+            sum!(p(f0_2, f5), p(f1_2, f4), p(f2_2, f3), p(f6, f9_38), p(f7_2, f8_19)),
+            sum!(p(f0_2, f6), p(f1_2, f5_2), p(f2_2, f4), p(f3_2, f3), p(f7_2, f9_38), p(f8, f8_19)),
+            sum!(p(f0_2, f7), p(f1_2, f6), p(f2_2, f5), p(f3_2, f4), p(f8, f9_38)),
+            sum!(p(f0_2, f8), p(f1_2, f7_2), p(f2_2, f6), p(f3_2, f5_2), p(f4, f4), p(f9, f9_38)),
+            sum!(p(f0_2, f9), p(f1_2, f8), p(f2_2, f7), p(f3_2, f6), p(f4_2, f5)),
+        ];
+        carry8(&mut h);
+        Fe8 { l: h }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn add8(f: &Fe8, g: &Fe8) -> Fe8 {
+        Fe8 {
+            l: core::array::from_fn(|i| _mm512_add_epi64(f.l[i], g.l[i])),
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn sub8(f: &Fe8, g: &Fe8) -> Fe8 {
+        Fe8 {
+            l: core::array::from_fn(|i| _mm512_sub_epi64(f.l[i], g.l[i])),
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn broadcast(fe: &Fe) -> Fe8 {
+        Fe8 {
+            l: core::array::from_fn(|i| _mm512_set1_epi64(fe[i] as i64)),
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn load8(fes: &[Fe; 8]) -> Fe8 {
+        Fe8 {
+            l: core::array::from_fn(|i| {
+                _mm512_set_epi64(
+                    fes[7][i] as i64,
+                    fes[6][i] as i64,
+                    fes[5][i] as i64,
+                    fes[4][i] as i64,
+                    fes[3][i] as i64,
+                    fes[2][i] as i64,
+                    fes[1][i] as i64,
+                    fes[0][i] as i64,
+                )
+            }),
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn store8(x: &Fe8) -> [Fe; 8] {
+        let mut out = [[0i32; 10]; 8];
+        let mut tmp = [0i64; 8];
+        for i in 0..10 {
+            _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, x.l[i]);
+            for k in 0..8 {
+                out[k][i] = tmp[k] as i32;
+            }
+        }
+        out
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct Point8 {
+        pub x: Fe8,
+        pub y: Fe8,
+        pub z: Fe8,
+        pub t: Fe8,
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct Niels8 {
+        pub yp: Fe8,
+        pub ym: Fe8,
+        pub z: Fe8,
+        pub t2d: Fe8,
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn madd8(p: &Point8, n: &Niels8) -> Point8 {
+        let yp_x = add8(&p.y, &p.x);
+        let ym_x = sub8(&p.y, &p.x);
+        let pp = mul8(&yp_x, &n.yp);
+        let mm = mul8(&ym_x, &n.ym);
+        let tt2d = mul8(&p.t, &n.t2d);
+        let zz = mul8(&p.z, &n.z);
+        let zz2 = add8(&zz, &zz);
+        let cx = sub8(&pp, &mm);
+        let cy = add8(&pp, &mm);
+        let cz = add8(&zz2, &tt2d);
+        let ct = sub8(&zz2, &tt2d);
+        Point8 {
+            x: mul8(&cx, &ct),
+            y: mul8(&cy, &cz),
+            z: mul8(&cz, &ct),
+            t: mul8(&cx, &cy),
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn invert8(z: &Fe8) -> Fe8 {
+        let mut t0 = sq8(z);
+        let mut t1 = sq8(&t0);
+        t1 = sq8(&t1);
+        t1 = mul8(z, &t1);
+        t0 = mul8(&t0, &t1);
+        let mut t2 = sq8(&t0);
+        t1 = mul8(&t1, &t2);
+        t2 = sq8(&t1);
+        for _ in 1..5 {
+            t2 = sq8(&t2);
+        }
+        t1 = mul8(&t2, &t1);
+        t2 = sq8(&t1);
+        for _ in 1..10 {
+            t2 = sq8(&t2);
+        }
+        t2 = mul8(&t2, &t1);
+        let mut t3 = sq8(&t2);
+        for _ in 1..20 {
+            t3 = sq8(&t3);
+        }
+        t2 = mul8(&t3, &t2);
+        t2 = sq8(&t2);
+        for _ in 1..10 {
+            t2 = sq8(&t2);
+        }
+        t1 = mul8(&t2, &t1);
+        t2 = sq8(&t1);
+        for _ in 1..50 {
+            t2 = sq8(&t2);
+        }
+        t2 = mul8(&t2, &t1);
+        t3 = sq8(&t2);
+        for _ in 1..100 {
+            t3 = sq8(&t3);
+        }
+        t2 = mul8(&t3, &t2);
+        t2 = sq8(&t2);
+        for _ in 1..50 {
+            t2 = sq8(&t2);
+        }
+        t1 = mul8(&t2, &t1);
+        t1 = sq8(&t1);
+        for _ in 1..5 {
+            t1 = sq8(&t1);
+        }
+        mul8(&t1, &t0)
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn point8_from_xyzt(
+        x: &[Fe; 8],
+        y: &[Fe; 8],
+        z: &[Fe; 8],
+        t: &[Fe; 8],
+    ) -> Point8 {
+        Point8 {
+            x: load8(x),
+            y: load8(y),
+            z: load8(z),
+            t: load8(t),
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn niels8_from_bytes(nb: &[[u8; 32]; 4]) -> Niels8 {
+        Niels8 {
+            yp: broadcast(&super::fe_frombytes(&nb[0])),
+            ym: broadcast(&super::fe_frombytes(&nb[1])),
+            z: broadcast(&super::fe_frombytes(&nb[2])),
+            t2d: broadcast(&super::fe_frombytes(&nb[3])),
+        }
+    }
+
+    /// 8-wide analog of [`super::avx2::chain_y_only`]: `8·K` keys per call.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn chain_y_only<const K: usize>(
+        mut p: Point8,
+        niels: &Niels8,
+        out: &mut [[[u8; 32]; 8]; K],
+    ) -> Point8 {
+        let mut ys = [p.y; K];
+        let mut zs = [p.z; K];
+        for s in 0..K {
+            ys[s] = p.y;
+            zs[s] = p.z;
+            p = madd8(&p, niels);
+        }
+        let one = broadcast(&super::FE_ONE);
+        let mut prefix = [one; K];
+        let mut acc = one;
+        for s in 0..K {
+            prefix[s] = acc;
+            acc = mul8(&acc, &zs[s]);
+        }
+        let mut inv = invert8(&acc);
+        for s in (0..K).rev() {
+            let zinv = mul8(&inv, &prefix[s]);
+            inv = mul8(&inv, &zs[s]);
+            let yz = mul8(&ys[s], &zinv);
+            let lanes = store8(&yz);
+            for lane in 0..8 {
+                out[s][lane] = super::fe_tobytes(&lanes[lane]);
+            }
+        }
+        p
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,6 +1238,74 @@ mod tests {
                     "chain_y_only mismatch lane {lane} step {s}"
                 );
                 assert_eq!(out[s][lane][31] & 0x80, 0);
+                cur += step;
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd_mul8_matches_dalek() {
+        if !is_x86_feature_detected!("avx512f") {
+            eprintln!("AVX-512F not available, skipping");
+            return;
+        }
+        let mut st = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..300 {
+            let ab: [[u8; 32]; 8] = core::array::from_fn(|_| rand_fe_bytes(&mut st));
+            let bb: [[u8; 32]; 8] = core::array::from_fn(|_| rand_fe_bytes(&mut st));
+            let fa: [Fe; 8] = core::array::from_fn(|k| fe_frombytes(&ab[k]));
+            let fb: [Fe; 8] = core::array::from_fn(|k| fe_frombytes(&bb[k]));
+            let prod = unsafe {
+                let r = avx512::mul8(&avx512::load8(&fa), &avx512::load8(&fb));
+                avx512::store8(&r)
+            };
+            for k in 0..8 {
+                assert_eq!(
+                    fe_tobytes(&prod[k]),
+                    EdwardsPoint::field_mul_reference(&ab[k], &bb[k]),
+                    "mul8 lane {k}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd_chain_y_only8_matches_dalek() {
+        use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
+        use curve25519_dalek::scalar::Scalar;
+        if !is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        const K: usize = 8;
+        let step = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
+        let niels = unsafe { avx512::niels8_from_bytes(&step.niels_bytes()) };
+        let mut stt = 0x1357_9bdf_0246_8aceu64;
+        let starts: [_; 8] = core::array::from_fn(|_| {
+            EdwardsPoint::mul_base_clamped({
+                let mut s = rand_fe_bytes(&mut stt);
+                s[0] &= 248;
+                s[31] = (s[31] & 63) | 64;
+                s
+            })
+        });
+        let xyzt: [_; 8] = core::array::from_fn(|k| starts[k].xyzt_bytes());
+        let p8 = unsafe {
+            avx512::point8_from_xyzt(
+                &core::array::from_fn(|k| fe_frombytes(&xyzt[k][0])),
+                &core::array::from_fn(|k| fe_frombytes(&xyzt[k][1])),
+                &core::array::from_fn(|k| fe_frombytes(&xyzt[k][2])),
+                &core::array::from_fn(|k| fe_frombytes(&xyzt[k][3])),
+            )
+        };
+        let mut out = [[[0u8; 32]; 8]; K];
+        unsafe { avx512::chain_y_only::<K>(p8, &niels, &mut out) };
+        for lane in 0..8 {
+            let mut cur = starts[lane];
+            for s in 0..K {
+                let exp = cur.compress().to_bytes();
+                assert_eq!(out[s][lane][..31], exp[..31], "chain8 lane {lane} step {s}");
                 cur += step;
             }
         }
