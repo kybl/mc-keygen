@@ -21,7 +21,9 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, Paragraph},
 };
 
-use search::SearchHandle;
+use std::sync::Arc;
+
+use search::{SearchHandle, Target};
 
 #[derive(Parser)]
 #[command(
@@ -35,9 +37,18 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Hex prefix(es) to search for (1-62 chars, 0-9/A-F each)
-    #[arg(required = true)]
+    /// Hex pattern(s) to match (0-9/A-F). Position is set by --where; with
+    /// multiple patterns, any match wins.
     prefix: Vec<String>,
+
+    /// Where in the key the pattern must appear.
+    #[arg(long = "where", value_enum, default_value_t = WhereArg::Prefix)]
+    location: WhereArg,
+
+    /// Instead of an exact pattern, find a run of at least N identical hex
+    /// characters (use with --where to pick prefix/anywhere/suffix).
+    #[arg(long, value_name = "N", conflicts_with = "prefix")]
+    run: Option<u32>,
 
     /// Number of worker threads (default: all cores)
     #[arg(short = 't', long = "threads")]
@@ -67,6 +78,48 @@ struct Cli {
 enum Command {
     /// Benchmark performance across CPU/GPU/hybrid modes and save JSONL records.
     Bench(bench::BenchArgs),
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum WhereArg {
+    /// Match at the start of the key (default).
+    Prefix,
+    /// Match anywhere in the key.
+    Anywhere,
+    /// Match at the end of the key.
+    Suffix,
+}
+
+impl From<WhereArg> for search::Location {
+    fn from(w: WhereArg) -> Self {
+        match w {
+            WhereArg::Prefix => search::Location::Prefix,
+            WhereArg::Anywhere => search::Location::Anywhere,
+            WhereArg::Suffix => search::Location::Suffix,
+        }
+    }
+}
+
+/// Validate a hex pattern for the given location. The 00/FF leading-byte rule
+/// and 62-char cap only apply to prefix search (which uses the sign-free fast
+/// path); anywhere/suffix patterns may be up to 64 chars and any hex.
+fn validate_pattern(pattern: &str, location: WhereArg) -> Result<String, String> {
+    let upper = pattern.to_ascii_uppercase();
+    let cap = 64;
+    if upper.is_empty() || upper.len() > cap {
+        return Err(format!(
+            "pattern must be 1-{} hex characters, got {}",
+            cap,
+            upper.len()
+        ));
+    }
+    if !upper.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("pattern must be valid hex (0-9, A-F), got '{}'", pattern));
+    }
+    if location == WhereArg::Prefix {
+        return validate_prefix(&upper);
+    }
+    Ok(upper)
 }
 
 pub(crate) fn validate_prefix(prefix: &str) -> Result<String, String> {
@@ -127,7 +180,7 @@ fn format_duration(secs: f64) -> String {
 
 fn run_tui_loop(
     handle: SearchHandle,
-    prefixes: &[String],
+    search_desc: &str,
     expected: u64,
     mode_label: &str,
 ) -> io::Result<Result<types::SearchResult, types::SearchError>> {
@@ -135,16 +188,8 @@ fn run_tui_loop(
     execute!(stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let prefix_display = if prefixes.len() == 1 {
-        prefixes[0].clone()
-    } else {
-        prefixes.join(", ")
-    };
-    let prefix_label = if prefixes.len() == 1 {
-        "Searching for prefix: ".to_string()
-    } else {
-        format!("Searching for {} prefixes: ", prefixes.len())
-    };
+    let prefix_display = search_desc.to_string();
+    let prefix_label = "Searching for: ".to_string();
 
     let result = loop {
         let stats = handle.stats(expected);
@@ -311,22 +356,28 @@ fn print_colored_result(result: &types::SearchResult) {
     );
     eprintln!();
 
-    // Public key with matched prefix highlighted
-    let prefix_len = result.matched_prefix.len();
-    let pk_prefix = &result.public_key[..prefix_len];
-    let pk_rest = &result.public_key[prefix_len..];
-    eprint!(
-        "{}",
-        style::style("Public Key:  ").dim()
-    );
-    eprint!(
-        "{}",
-        style::style(pk_prefix).green().bold()
-    );
     eprintln!(
-        "{}",
-        style::style(pk_rest).white()
+        "{}{}",
+        style::style("Matched:     ").dim(),
+        style::style(&result.matched_prefix).yellow().bold()
     );
+
+    // Public key, highlighting the matched hex pattern wherever it occurs.
+    eprint!("{}", style::style("Public Key:  ").dim());
+    let needle = result.matched_prefix.to_ascii_uppercase();
+    if !needle.is_empty() {
+        if let Some(pos) = result.public_key.find(&needle) {
+            let (before, rest) = result.public_key.split_at(pos);
+            let (matched, after) = rest.split_at(needle.len());
+            eprint!("{}", style::style(before).white());
+            eprint!("{}", style::style(matched).green().bold());
+            eprintln!("{}", style::style(after).white());
+        } else {
+            eprintln!("{}", style::style(&result.public_key).white());
+        }
+    } else {
+        eprintln!("{}", style::style(&result.public_key).white());
+    }
 
     // Private key
     eprint!(
@@ -394,31 +445,52 @@ fn main() {
         return;
     }
 
-    let mut prefixes = Vec::new();
-    for raw in &cli.prefix {
-        match validate_prefix(raw) {
-            Ok(p) => prefixes.push(p),
-            Err(e) => {
-                if cli.json {
-                    eprintln!("Error: {}", e);
-                } else {
-                    print_colored_error(&e);
+    let report_error = |e: &str| {
+        if cli.json {
+            eprintln!("Error: {}", e);
+        } else {
+            print_colored_error(e);
+        }
+    };
+
+    // Build the search target from --where / --run / patterns.
+    let (target, what_desc) = if let Some(n) = cli.run {
+        if !(1..=64).contains(&n) {
+            report_error("--run N must be between 1 and 64");
+            std::process::exit(1);
+        }
+        (
+            Target::run(cli.location.into(), n),
+            format!("run of {}+ identical chars", n),
+        )
+    } else {
+        if cli.prefix.is_empty() {
+            report_error("specify one or more hex patterns, or --run N");
+            std::process::exit(1);
+        }
+        let mut patterns = Vec::new();
+        for raw in &cli.prefix {
+            match validate_pattern(raw, cli.location) {
+                Ok(p) => patterns.push(p),
+                Err(e) => {
+                    report_error(&e);
+                    std::process::exit(1);
                 }
-                std::process::exit(1);
             }
         }
-    }
-
-    // Expected attempts: use shortest prefix length, divided by count of same-length prefixes
-    let min_len = prefixes.iter().map(|p| p.len()).min().unwrap();
-    let same_len_count = prefixes.iter().filter(|p| p.len() == min_len).count() as u64;
-    let expected = 16u64.pow(min_len as u32) / same_len_count;
-
-    let prefix_count_label = if prefixes.len() == 1 {
-        String::new()
-    } else {
-        format!(", {} prefixes", prefixes.len())
+        let desc = patterns.join(", ");
+        (Target::exact(cli.location.into(), &patterns), desc)
     };
+    let target = Arc::new(target);
+
+    let expected = target.expected_attempts();
+
+    let where_desc = match cli.location {
+        WhereArg::Prefix => "prefix",
+        WhereArg::Anywhere => "anywhere",
+        WhereArg::Suffix => "suffix",
+    };
+    let search_desc = format!("{} [{}]", what_desc, where_desc);
 
     #[cfg(feature = "gpu")]
     let cpu_only = cli.cpu_only;
@@ -449,10 +521,15 @@ fn main() {
         }
     }
 
-    let gpu_searchers = if cpu_only {
-        vec![]
-    } else {
-        try_init_gpu(&prefixes)
+    // The GPU kernels only do prefix-exact search; other modes are CPU-only.
+    let gpu_prefixes = target.gpu_prefixes();
+    if gpu_only && gpu_prefixes.is_none() {
+        report_error("--gpu-only only supports prefix search (not --where anywhere/suffix or --run)");
+        std::process::exit(1);
+    }
+    let gpu_searchers = match (cpu_only, &gpu_prefixes) {
+        (false, Some(p)) => try_init_gpu(p),
+        _ => vec![],
     };
 
     // Hybrid mode reserves cores for the GPU dispatch thread; pure-CPU uses
@@ -469,24 +546,19 @@ fn main() {
 
     let (handle, mode_label) = if gpu_only {
         if gpu_searchers.is_empty() {
-            let msg = "--gpu-only requested but no GPU available";
-            if cli.json {
-                eprintln!("Error: {}", msg);
-            } else {
-                print_colored_error(msg);
-            }
+            report_error("--gpu-only requested but no GPU available");
             std::process::exit(1);
         }
-        let label = format!("{}{}", gpu_names_label(&gpu_searchers), prefix_count_label);
-        (SearchHandle::start_gpu(&prefixes, gpu_searchers), label)
+        let label = gpu_names_label(&gpu_searchers);
+        (SearchHandle::start_gpu(Arc::clone(&target), gpu_searchers), label)
     } else if gpu_searchers.is_empty() {
-        let label = format!("{} threads{}", num_threads, prefix_count_label);
-        (SearchHandle::start(&prefixes, num_threads), label)
+        let label = format!("{} threads", num_threads);
+        (SearchHandle::start(Arc::clone(&target), num_threads), label)
     } else {
         let gpu_label = gpu_names_label(&gpu_searchers);
-        let label = format!("{} + {} threads{}", gpu_label, num_threads, prefix_count_label);
+        let label = format!("{} + {} threads", gpu_label, num_threads);
         (
-            SearchHandle::start_hybrid(&prefixes, num_threads, gpu_searchers),
+            SearchHandle::start_hybrid(Arc::clone(&target), num_threads, gpu_searchers),
             label,
         )
     };
@@ -500,7 +572,7 @@ fn main() {
             }
         }
     } else {
-        let search_result = match run_tui_loop(handle, &prefixes, expected, &mode_label) {
+        let search_result = match run_tui_loop(handle, &search_desc, expected, &mode_label) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("TUI error: {}", e);

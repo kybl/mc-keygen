@@ -80,8 +80,9 @@ pub fn default_hybrid_cpu_threads(num_gpus: usize) -> usize {
     logical.saturating_sub(smt_factor * num_gpus).max(1)
 }
 
-/// Parsed prefix for fast nibble-level matching.
-/// Avoids hex-encoding every public key in the hot loop.
+/// Parsed prefix for fast nibble-level matching. Used by the GPU backends to
+/// pack prefix data; the CPU path matches via [`Target`].
+#[allow(dead_code)]
 pub struct PrefixMatcher {
     /// Full bytes to match (pairs of hex chars).
     pub(crate) full_bytes: Vec<u8>,
@@ -89,6 +90,7 @@ pub struct PrefixMatcher {
     pub(crate) trailing_nibble: Option<u8>,
 }
 
+#[allow(dead_code)]
 impl PrefixMatcher {
     /// Parse a hex prefix string into a matcher.
     /// Assumes input is already validated as uppercase hex.
@@ -168,6 +170,204 @@ fn should_skip(public_key: &[u8; 32]) -> bool {
     public_key[0] == 0x00 || public_key[0] == 0xFF
 }
 
+/// The high nibble of byte 31 carries the Ed25519 sign bit, which the y-only
+/// fast path leaves zeroed. Matching that touches this nibble is therefore done
+/// leniently on the y-only encoding and confirmed on the recomputed real key.
+const SIGN_NIBBLE: usize = 62;
+
+/// Hex nibble at position `pos` (0..64) of a public key.
+#[inline(always)]
+fn nibble_at(pk: &[u8; 32], pos: usize) -> u8 {
+    let b = pk[pos >> 1];
+    if pos & 1 == 0 {
+        b >> 4
+    } else {
+        b & 0x0F
+    }
+}
+
+/// Where in the 64-hex-char key the pattern must appear.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Location {
+    Prefix,
+    Anywhere,
+    Suffix,
+}
+
+/// What to look for.
+enum What {
+    /// Exact hex pattern(s), each stored as `(label, nibble values)`.
+    Exact(Vec<(String, Vec<u8>)>),
+    /// A run of at least N identical hex characters.
+    Run(u32),
+}
+
+/// A search target: a location (where) combined with a criterion (what).
+pub struct Target {
+    location: Location,
+    what: What,
+}
+
+/// True if `pk` matches the exact nibble pattern at `loc`. In `candidate` mode
+/// (y-only encoding) the sign nibble is treated as a wildcard.
+fn exact_match(pk: &[u8; 32], nibs: &[u8], loc: Location, candidate: bool) -> bool {
+    let l = nibs.len();
+    let eq = |pos: usize, val: u8| (candidate && pos == SIGN_NIBBLE) || nibble_at(pk, pos) == val;
+    match loc {
+        Location::Prefix => (0..l).all(|j| eq(j, nibs[j])),
+        Location::Suffix => (0..l).all(|j| eq(64 - l + j, nibs[j])),
+        Location::Anywhere => (0..=64 - l).any(|start| (0..l).all(|j| eq(start + j, nibs[j]))),
+    }
+}
+
+/// Longest run of identical nibbles. In `candidate` mode the sign nibble acts
+/// as a wildcard that extends any run (a sound over-approximation).
+fn longest_run(pk: &[u8; 32], candidate: bool) -> u32 {
+    let mut max = 1u32;
+    let mut run = 1u32;
+    let mut prev = nibble_at(pk, 0);
+    for pos in 1..64 {
+        if candidate && pos == SIGN_NIBBLE {
+            run += 1; // wildcard: assume it continues the current run
+        } else {
+            let nb = nibble_at(pk, pos);
+            if nb == prev {
+                run += 1;
+            } else {
+                run = 1;
+                prev = nb;
+            }
+        }
+        if run > max {
+            max = run;
+        }
+    }
+    max
+}
+
+/// True if `pk` has a run of `>= n` identical nibbles at `loc`.
+fn run_match(pk: &[u8; 32], n: u32, loc: Location, candidate: bool) -> bool {
+    let n = n as usize;
+    let eq = |pos: usize, c: u8| (candidate && pos == SIGN_NIBBLE) || nibble_at(pk, pos) == c;
+    match loc {
+        Location::Prefix => {
+            let c = nibble_at(pk, 0);
+            n <= 64 && (0..n).all(|pos| eq(pos, c))
+        }
+        Location::Suffix => {
+            let c = nibble_at(pk, 63);
+            n <= 64 && (0..n).all(|j| eq(63 - j, c))
+        }
+        Location::Anywhere => longest_run(pk, candidate) >= n as u32,
+    }
+}
+
+impl Target {
+    pub fn exact(location: Location, patterns: &[String]) -> Self {
+        let exact = patterns
+            .iter()
+            .map(|p| {
+                let nibs = p.bytes().map(nibble_from_ascii).collect();
+                (p.clone(), nibs)
+            })
+            .collect();
+        Target {
+            location,
+            what: What::Exact(exact),
+        }
+    }
+
+    pub fn run(location: Location, n: u32) -> Self {
+        Target {
+            location,
+            what: What::Run(n),
+        }
+    }
+
+    /// Sound over-approximation on the y-only encoding (sign bit zeroed): never
+    /// a false negative. Candidates are confirmed by [`Target::authoritative`].
+    #[inline]
+    pub fn candidate(&self, pk: &[u8; 32]) -> bool {
+        match &self.what {
+            What::Exact(ts) => ts.iter().any(|(_, nibs)| exact_match(pk, nibs, self.location, true)),
+            What::Run(n) => run_match(pk, *n, self.location, true),
+        }
+    }
+
+    /// Exact check on the true compressed key; returns the matched label.
+    #[inline]
+    pub fn authoritative(&self, pk: &[u8; 32]) -> Option<String> {
+        match &self.what {
+            What::Exact(ts) => ts
+                .iter()
+                .find(|(_, nibs)| exact_match(pk, nibs, self.location, false))
+                .map(|(l, _)| l.clone()),
+            What::Run(n) => {
+                run_match(pk, *n, self.location, false).then(|| format!("{}+ identical", n))
+            }
+        }
+    }
+
+    /// First-byte prefilter data for the AVX-512 fast path. Only prefix-exact
+    /// search has a usable leading-byte constraint.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub fn first_byte_filter(&self) -> Option<Vec<(u8, u8)>> {
+        match (self.location, &self.what) {
+            (Location::Prefix, What::Exact(ts)) => Some(
+                ts.iter()
+                    .map(|(_, nibs)| {
+                        if nibs.len() >= 2 {
+                            (0xFF, (nibs[0] << 4) | nibs[1])
+                        } else {
+                            (0xF0, nibs[0] << 4)
+                        }
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Prefix strings if this is a prefix-exact search (the only mode the GPU
+    /// kernels support); `None` otherwise (CPU-only).
+    pub fn gpu_prefixes(&self) -> Option<Vec<String>> {
+        match (self.location, &self.what) {
+            (Location::Prefix, What::Exact(ts)) => Some(ts.iter().map(|(l, _)| l.clone()).collect()),
+            _ => None,
+        }
+    }
+
+    /// Rough expected number of keys to try, for the progress display.
+    pub fn expected_attempts(&self) -> u64 {
+        let p: f64 = match &self.what {
+            What::Exact(ts) => ts
+                .iter()
+                .map(|(_, nibs)| {
+                    let l = nibs.len() as i32;
+                    let positions = match self.location {
+                        Location::Anywhere => (64 - l + 1).max(1) as f64,
+                        _ => 1.0,
+                    };
+                    positions * 16f64.powi(-l)
+                })
+                .sum(),
+            What::Run(n) => {
+                let n = *n as i32;
+                let positions = match self.location {
+                    Location::Anywhere => (64 - n + 1).max(1) as f64,
+                    _ => 1.0,
+                };
+                positions * 16f64.powi(-(n - 1))
+            }
+        };
+        if p > 0.0 {
+            (1.0 / p).min(u64::MAX as f64) as u64
+        } else {
+            u64::MAX
+        }
+    }
+}
+
 /// Internal result containing keypair + which prefix matched.
 struct MatchResult {
     keypair: MeshCoreKeypair,
@@ -186,13 +386,7 @@ pub struct SearchHandle {
 
 impl SearchHandle {
     /// Start a vanity key search in background threads.
-    pub fn start(prefixes: &[String], num_threads: usize) -> Self {
-        let matchers: Arc<Vec<(String, PrefixMatcher)>> = Arc::new(
-            prefixes
-                .iter()
-                .map(|p| (p.clone(), PrefixMatcher::new(p)))
-                .collect(),
-        );
+    pub fn start(target: Arc<Target>, num_threads: usize) -> Self {
         let found = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicU64::new(0));
         let result: Arc<Mutex<Option<MatchResult>>> = Arc::new(Mutex::new(None));
@@ -200,7 +394,7 @@ impl SearchHandle {
         let mut workers = Vec::with_capacity(num_threads);
         for _ in 0..num_threads {
             workers.push(spawn_cpu_worker(
-                Arc::clone(&matchers),
+                Arc::clone(&target),
                 Arc::clone(&found),
                 Arc::clone(&attempts),
                 Arc::clone(&result),
@@ -263,16 +457,7 @@ impl SearchHandle {
     }
 
     /// Start a GPU-only vanity key search. Spawns one thread per GPU device.
-    pub fn start_gpu(
-        prefixes: &[String],
-        gpu_searchers: Vec<Box<dyn GpuSearcher>>,
-    ) -> Self {
-        let matchers: Arc<Vec<(String, PrefixMatcher)>> = Arc::new(
-            prefixes
-                .iter()
-                .map(|p| (p.clone(), PrefixMatcher::new(p)))
-                .collect(),
-        );
+    pub fn start_gpu(target: Arc<Target>, gpu_searchers: Vec<Box<dyn GpuSearcher>>) -> Self {
         let found = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicU64::new(0));
         let result: Arc<Mutex<Option<MatchResult>>> = Arc::new(Mutex::new(None));
@@ -280,11 +465,11 @@ impl SearchHandle {
         let mut workers = Vec::with_capacity(gpu_searchers.len());
         for searcher in gpu_searchers {
             workers.push(thread::spawn({
-                let matchers = Arc::clone(&matchers);
+                let target = Arc::clone(&target);
                 let found = Arc::clone(&found);
                 let attempts = Arc::clone(&attempts);
                 let result = Arc::clone(&result);
-                move || gpu_dispatch_loop(searcher, matchers, found, attempts, result)
+                move || gpu_dispatch_loop(searcher, target, found, attempts, result)
             }));
         }
 
@@ -299,16 +484,10 @@ impl SearchHandle {
 
     /// Start a hybrid vanity key search: CPU threads + GPU devices concurrently.
     pub fn start_hybrid(
-        prefixes: &[String],
+        target: Arc<Target>,
         cpu_threads: usize,
         gpu_searchers: Vec<Box<dyn GpuSearcher>>,
     ) -> Self {
-        let matchers: Arc<Vec<(String, PrefixMatcher)>> = Arc::new(
-            prefixes
-                .iter()
-                .map(|p| (p.clone(), PrefixMatcher::new(p)))
-                .collect(),
-        );
         let found = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicU64::new(0));
         let result: Arc<Mutex<Option<MatchResult>>> = Arc::new(Mutex::new(None));
@@ -318,7 +497,7 @@ impl SearchHandle {
         // Spawn CPU workers
         for _ in 0..cpu_threads {
             workers.push(spawn_cpu_worker(
-                Arc::clone(&matchers),
+                Arc::clone(&target),
                 Arc::clone(&found),
                 Arc::clone(&attempts),
                 Arc::clone(&result),
@@ -328,11 +507,11 @@ impl SearchHandle {
         // Spawn GPU dispatch threads
         for searcher in gpu_searchers {
             workers.push(thread::spawn({
-                let matchers = Arc::clone(&matchers);
+                let target = Arc::clone(&target);
                 let found = Arc::clone(&found);
                 let attempts = Arc::clone(&attempts);
                 let result = Arc::clone(&result);
-                move || gpu_dispatch_loop(searcher, matchers, found, attempts, result)
+                move || gpu_dispatch_loop(searcher, target, found, attempts, result)
             }));
         }
 
@@ -370,7 +549,7 @@ const CHAIN_BATCH: usize = 512;
 /// `N` cheap chain steps amortizing one field inversion. Per-iter cost
 /// goes from ~265 fe_muls (one full `compress`) to ~20 (batched).
 fn spawn_cpu_worker(
-    matchers: Arc<Vec<(String, PrefixMatcher)>>,
+    target: Arc<Target>,
     found: Arc<AtomicBool>,
     attempts: Arc<AtomicU64>,
     result: Arc<Mutex<Option<MatchResult>>>,
@@ -383,16 +562,16 @@ fn spawn_cpu_worker(
         {
             if CHAIN_BATCH % 8 == 0 && std::is_x86_feature_detected!("avx512f") {
                 // SAFETY: guarded by the runtime avx512f check.
-                unsafe { cpu_worker_simd512(&matchers, &found, &attempts, &result) };
+                unsafe { cpu_worker_simd512(&target, &found, &attempts, &result) };
                 return;
             }
             if CHAIN_BATCH % 4 == 0 && std::is_x86_feature_detected!("avx2") {
                 // SAFETY: guarded by the runtime avx2 check above.
-                unsafe { cpu_worker_simd(&matchers, &found, &attempts, &result) };
+                unsafe { cpu_worker_simd(&target, &found, &attempts, &result) };
                 return;
             }
         }
-        cpu_worker_scalar(&matchers, &found, &attempts, &result);
+        cpu_worker_scalar(&target, &found, &attempts, &result);
     })
 }
 
@@ -422,7 +601,7 @@ fn record_match(
 
 /// Scalar `+8B` chained-compress worker (portable fallback).
 fn cpu_worker_scalar(
-    matchers: &[(String, PrefixMatcher)],
+    target: &Target,
     found: &AtomicBool,
     attempts: &AtomicU64,
     result: &Mutex<Option<MatchResult>>,
@@ -440,21 +619,21 @@ fn cpu_worker_scalar(
         let (compressed, next_point) = point.chain_compress_y_only::<CHAIN_BATCH>(&eight_b);
 
         for (i, public_key) in compressed.iter().enumerate() {
-            if should_skip(public_key) {
+            if should_skip(public_key) || !target.candidate(public_key) {
                 continue;
             }
-            if let Some(matched) = matchers.iter().find(|(_, m)| m.matches(public_key)) {
+            // Candidate on the y-only encoding: recompute point + i·8B and
+            // compress it properly (with sign) for the authoritative check.
+            let mut hit_point = point;
+            for _ in 0..i {
+                hit_point += eight_b;
+            }
+            let real = hit_point.compress().to_bytes();
+            if let Some(label) = target.authoritative(&real) {
                 let mut match_scalar = scalar;
                 advance_scalar(&mut match_scalar, 8 * i as u64);
-                // Sign bit was zeroed and full points weren't kept; recompute
-                // point + i·8B and compress it properly for the hit.
-                let mut hit_point = point;
-                for _ in 0..i {
-                    hit_point += eight_b;
-                }
-                let public_key = hit_point.compress().to_bytes();
                 attempts.fetch_add(local_count + i as u64 + 1, Ordering::Relaxed);
-                record_match(matched.0.clone(), public_key, match_scalar, found, result);
+                record_match(label, real, match_scalar, found, result);
                 return;
             }
         }
@@ -476,7 +655,7 @@ fn cpu_worker_scalar(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn cpu_worker_simd(
-    matchers: &[(String, PrefixMatcher)],
+    target: &Target,
     found: &AtomicBool,
     attempts: &AtomicU64,
     result: &Mutex<Option<MatchResult>>,
@@ -515,24 +694,22 @@ unsafe fn cpu_worker_simd(
         for s in 0..K {
             for lane in 0..4 {
                 let public_key = &out[s][lane];
-                if should_skip(public_key) {
+                if should_skip(public_key) || !target.candidate(public_key) {
                     continue;
                 }
-                if let Some(matched) = matchers.iter().find(|(_, m)| m.matches(public_key)) {
+                let mut hit = starts[lane];
+                for _ in 0..s {
+                    hit += eight_b;
+                }
+                let real = hit.compress().to_bytes();
+                if let Some(label) = target.authoritative(&real) {
                     let mut match_scalar = scalars[lane];
                     advance_scalar(&mut match_scalar, 8 * s as u64);
-                    // Recompute the true signed pubkey for this lane/step from
-                    // the dalek start point kept in lockstep.
-                    let mut hit = starts[lane];
-                    for _ in 0..s {
-                        hit += eight_b;
-                    }
-                    let public_key = hit.compress().to_bytes();
                     attempts.fetch_add(
                         local_count + (s * 4 + lane) as u64 + 1,
                         Ordering::Relaxed,
                     );
-                    record_match(matched.0.clone(), public_key, match_scalar, found, result);
+                    record_match(label, real, match_scalar, found, result);
                     return;
                 }
             }
@@ -558,7 +735,7 @@ unsafe fn cpu_worker_simd(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn cpu_worker_simd512(
-    matchers: &[(String, PrefixMatcher)],
+    target: &Target,
     found: &AtomicBool,
     attempts: &AtomicU64,
     result: &Mutex<Option<MatchResult>>,
@@ -586,33 +763,35 @@ unsafe fn cpu_worker_simd512(
         &core::array::from_fn(|l| fe_frombytes(&xyzt[l][3])),
     );
 
-    let filter: Vec<(u8, u8)> = matchers.iter().map(|(_, m)| m.first_byte_filter()).collect();
+    // Prefix-exact search supplies a first-byte filter (prefilter fast path);
+    // other modes fully encode every lane.
+    let filter = target.first_byte_filter();
 
     let mut out: Box<[[[u8; 32]; 8]; K]> = Box::new([[[0u8; 32]; 8]; K]);
     let mut local_count: u64 = 0;
 
     while !found.load(Ordering::Relaxed) {
-        p8 = avx512::chain_y_only::<K>(p8, &niels, &filter, &mut out);
+        p8 = avx512::chain_y_only::<K>(p8, &niels, filter.as_deref(), &mut out);
 
         for s in 0..K {
             for lane in 0..8 {
                 let public_key = &out[s][lane];
-                if should_skip(public_key) {
+                if should_skip(public_key) || !target.candidate(public_key) {
                     continue;
                 }
-                if let Some(matched) = matchers.iter().find(|(_, m)| m.matches(public_key)) {
+                let mut hit = starts[lane];
+                for _ in 0..s {
+                    hit += eight_b;
+                }
+                let real = hit.compress().to_bytes();
+                if let Some(label) = target.authoritative(&real) {
                     let mut match_scalar = scalars[lane];
                     advance_scalar(&mut match_scalar, 8 * s as u64);
-                    let mut hit = starts[lane];
-                    for _ in 0..s {
-                        hit += eight_b;
-                    }
-                    let public_key = hit.compress().to_bytes();
                     attempts.fetch_add(
                         local_count + (s * 8 + lane) as u64 + 1,
                         Ordering::Relaxed,
                     );
-                    record_match(matched.0.clone(), public_key, match_scalar, found, result);
+                    record_match(label, real, match_scalar, found, result);
                     return;
                 }
             }
@@ -636,7 +815,7 @@ unsafe fn cpu_worker_simd512(
 /// Runs search_batch in a loop until a match is found or another thread signals done.
 fn gpu_dispatch_loop(
     mut searcher: Box<dyn GpuSearcher>,
-    matchers: Arc<Vec<(String, PrefixMatcher)>>,
+    target: Arc<Target>,
     found: Arc<AtomicBool>,
     attempts: Arc<AtomicU64>,
     result: Arc<Mutex<Option<MatchResult>>>,
@@ -651,11 +830,10 @@ fn gpu_dispatch_loop(
                 attempts.fetch_add(batch_result.keys_checked, Ordering::Relaxed);
                 if let Some(kp) = batch_result.keypair {
                     found.store(true, Ordering::Relaxed);
-                    let matched_prefix = matchers
-                        .iter()
-                        .find(|(_, m)| m.matches(&kp.public_key))
-                        .map(|(p, _)| p.clone())
-                        .unwrap_or_else(|| matchers[0].0.clone());
+                    // The GPU kernel emits the true compressed key (with sign).
+                    let matched_prefix = target
+                        .authoritative(&kp.public_key)
+                        .unwrap_or_default();
                     *result.lock().unwrap() = Some(MatchResult {
                         keypair: kp,
                         matched_prefix,
@@ -675,6 +853,70 @@ fn gpu_dispatch_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_from_hex(h: &str) -> [u8; 32] {
+        let bytes = hex::decode(h).unwrap();
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&bytes);
+        k
+    }
+
+    #[test]
+    fn target_exact_locations() {
+        // ...AB at start, CD anywhere, EF at end.
+        let key = key_from_hex("AB00000000000000000000000000CD0000000000000000000000000000DD00EF");
+        assert!(Target::exact(Location::Prefix, &["AB".into()]).authoritative(&key).is_some());
+        assert!(Target::exact(Location::Prefix, &["CD".into()]).authoritative(&key).is_none());
+        assert!(Target::exact(Location::Anywhere, &["CD".into()]).authoritative(&key).is_some());
+        assert!(Target::exact(Location::Anywhere, &["DD00EF".into()]).authoritative(&key).is_some());
+        assert!(Target::exact(Location::Suffix, &["EF".into()]).authoritative(&key).is_some());
+        assert!(Target::exact(Location::Suffix, &["AB".into()]).authoritative(&key).is_none());
+    }
+
+    #[test]
+    fn target_run_locations() {
+        // 64 nibbles: CCC at the start, DDDDD in the middle, 777 at the end,
+        // the rest a 1,2,3,4 cycle so there are no other runs.
+        let mut nib = [0u8; 64];
+        for (i, n) in nib.iter_mut().enumerate() {
+            *n = 1 + (i % 4) as u8;
+        }
+        nib[0..3].fill(0xC);
+        nib[30..35].fill(0xD);
+        nib[61..64].fill(0x7);
+        let mut key = [0u8; 32];
+        for i in 0..32 {
+            key[i] = (nib[2 * i] << 4) | nib[2 * i + 1];
+        }
+        assert!(Target::run(Location::Prefix, 3).authoritative(&key).is_some());
+        assert!(Target::run(Location::Prefix, 4).authoritative(&key).is_none());
+        assert!(Target::run(Location::Anywhere, 5).authoritative(&key).is_some());
+        assert!(Target::run(Location::Anywhere, 6).authoritative(&key).is_none());
+        assert!(Target::run(Location::Suffix, 3).authoritative(&key).is_some());
+        assert!(Target::run(Location::Suffix, 4).authoritative(&key).is_none());
+    }
+
+    #[test]
+    fn target_candidate_never_misses_authoritative() {
+        // The candidate over-approximation must accept anything authoritative
+        // accepts, for every nibble value at the sign position.
+        for last_byte in 0u8..=255 {
+            let mut key = key_from_hex("AB000000000000000000000000000000000000000000000000000000000000CD");
+            key[31] = last_byte;
+            for t in [
+                Target::exact(Location::Suffix, &[format!("{:02X}", last_byte)]),
+                Target::run(Location::Suffix, 2),
+                Target::run(Location::Anywhere, 2),
+            ] {
+                if t.authoritative(&key).is_some() {
+                    // y-only zeroes the sign bit: emulate that and check candidate.
+                    let mut yonly = key;
+                    yonly[31] &= 0x7f;
+                    assert!(t.candidate(&yonly), "candidate missed a real match");
+                }
+            }
+        }
+    }
 
     #[test]
     fn prefix_matcher_full_bytes() {
@@ -759,7 +1001,7 @@ mod tests {
 
     #[test]
     fn search_handle_finds_single_char_prefix() {
-        let handle = SearchHandle::start(&["A".to_string()], 2);
+        let handle = SearchHandle::start(Arc::new(Target::exact(Location::Prefix, &["A".to_string()])), 2);
         let result = handle.finish().expect("search should find a match");
         assert!(
             result.public_key.starts_with('A'),
@@ -771,7 +1013,7 @@ mod tests {
 
     #[test]
     fn search_handle_multiple_prefixes() {
-        let handle = SearchHandle::start(&["A".to_string(), "B".to_string()], 2);
+        let handle = SearchHandle::start(Arc::new(Target::exact(Location::Prefix, &["A".to_string(), "B".to_string()])), 2);
         let result = handle.finish().expect("search should find a match");
         assert!(
             result.public_key.starts_with('A') || result.public_key.starts_with('B'),
@@ -791,7 +1033,7 @@ mod tests {
     /// `scalar·B == returned_pubkey` via curve25519-dalek.
     #[test]
     fn search_handle_scalar_matches_pubkey() {
-        let handle = SearchHandle::start(&["A".to_string()], 2);
+        let handle = SearchHandle::start(Arc::new(Target::exact(Location::Prefix, &["A".to_string()])), 2);
         let result = handle.finish().expect("search should find a match");
 
         let priv_bytes = hex::decode(&result.private_key).unwrap();

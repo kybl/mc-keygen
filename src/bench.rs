@@ -20,7 +20,7 @@ use serde::Serialize;
 use crate::search::GpuSearcher;
 #[cfg(feature = "gpu")]
 use crate::search::default_hybrid_cpu_threads;
-use crate::search::{advance_scalar, clamp_scalar, PrefixMatcher};
+use crate::search::{advance_scalar, clamp_scalar, Location, Target};
 
 const SCHEMA_VERSION: u32 = 2;
 
@@ -151,7 +151,7 @@ impl BenchHandle {
         }
     }
 
-    fn spawn_cpu_workers(&mut self, matchers: &Arc<Vec<PrefixMatcher>>, count: usize) {
+    fn spawn_cpu_workers(&mut self, matchers: &Arc<Target>, count: usize) {
         self.workers.reserve(count);
         for _ in 0..count {
             self.workers.push(spawn_cpu_bench_worker(
@@ -176,7 +176,7 @@ impl BenchHandle {
         }
     }
 
-    fn start_cpu(matchers: Arc<Vec<PrefixMatcher>>, threads: usize) -> Self {
+    fn start_cpu(matchers: Arc<Target>, threads: usize) -> Self {
         let mut h = Self::empty();
         h.spawn_cpu_workers(&matchers, threads);
         h
@@ -191,7 +191,7 @@ impl BenchHandle {
 
     #[cfg(feature = "gpu")]
     fn start_hybrid(
-        matchers: Arc<Vec<PrefixMatcher>>,
+        matchers: Arc<Target>,
         threads: usize,
         gpus: Vec<Box<dyn GpuSearcher>>,
     ) -> Self {
@@ -219,7 +219,7 @@ impl BenchHandle {
 /// first match. The `+8B` chained-compress hot loop is byte-identical, so
 /// we measure the same code path real searches use.
 fn spawn_cpu_bench_worker(
-    matchers: Arc<Vec<PrefixMatcher>>,
+    matchers: Arc<Target>,
     stop: Arc<AtomicBool>,
     keys: Arc<AtomicU64>,
     matches: Arc<AtomicU64>,
@@ -243,7 +243,7 @@ fn spawn_cpu_bench_worker(
 }
 
 fn bench_worker_scalar(
-    matchers: &[PrefixMatcher],
+    target: &Target,
     stop: &AtomicBool,
     keys: &AtomicU64,
     matches: &AtomicU64,
@@ -265,7 +265,7 @@ fn bench_worker_scalar(
             if public_key[0] == 0x00 || public_key[0] == 0xFF {
                 continue;
             }
-            if matchers.iter().any(|m| m.matches(public_key)) {
+            if target.candidate(public_key) {
                 local_matches += 1;
             }
         }
@@ -294,7 +294,7 @@ fn bench_worker_scalar(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn bench_worker_simd(
-    matchers: &[PrefixMatcher],
+    target: &Target,
     stop: &AtomicBool,
     keys: &AtomicU64,
     matches: &AtomicU64,
@@ -334,7 +334,7 @@ unsafe fn bench_worker_simd(
                 if public_key[0] == 0x00 || public_key[0] == 0xFF {
                     continue;
                 }
-                if matchers.iter().any(|m| m.matches(public_key)) {
+                if target.candidate(public_key) {
                     local_matches += 1;
                 }
             }
@@ -360,7 +360,7 @@ unsafe fn bench_worker_simd(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn bench_worker_simd512(
-    matchers: &[PrefixMatcher],
+    target: &Target,
     stop: &AtomicBool,
     keys: &AtomicU64,
     matches: &AtomicU64,
@@ -387,14 +387,14 @@ unsafe fn bench_worker_simd512(
         &core::array::from_fn(|l| fe_frombytes(&xyzt[l][3])),
     );
 
-    let filter: Vec<(u8, u8)> = matchers.iter().map(|m| m.first_byte_filter()).collect();
+    let filter = target.first_byte_filter();
 
     let mut out: Box<[[[u8; 32]; 8]; K]> = Box::new([[[0u8; 32]; 8]; K]);
     let mut local_keys: u64 = 0;
     let mut local_matches: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        p8 = avx512::chain_y_only::<K>(p8, &niels, &filter, &mut out);
+        p8 = avx512::chain_y_only::<K>(p8, &niels, filter.as_deref(), &mut out);
 
         for s in 0..K {
             for lane in 0..8 {
@@ -402,7 +402,7 @@ unsafe fn bench_worker_simd512(
                 if public_key[0] == 0x00 || public_key[0] == 0xFF {
                     continue;
                 }
-                if matchers.iter().any(|m| m.matches(public_key)) {
+                if target.candidate(public_key) {
                     local_matches += 1;
                 }
             }
@@ -533,12 +533,8 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn Error>> {
         .collect::<Result<_, _>>()
         .map_err(|e| -> Box<dyn Error> { e.into() })?;
 
-    let matchers: Arc<Vec<PrefixMatcher>> = Arc::new(
-        prefixes
-            .iter()
-            .map(|p| PrefixMatcher::new(p))
-            .collect(),
-    );
+    // The bench measures the prefix-exact path (the default search mode).
+    let matchers: Arc<Target> = Arc::new(Target::exact(Location::Prefix, &prefixes));
 
     let threads_explicit = args.threads.is_some();
     let threads = args.threads.unwrap_or_else(|| {
@@ -599,7 +595,7 @@ struct BenchContext<'a> {
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     threads_explicit: bool,
     prefixes: &'a [String],
-    matchers: Arc<Vec<PrefixMatcher>>,
+    matchers: Arc<Target>,
     duration: Duration,
     git: &'a BenchGit,
     machine_template: &'a BenchMachine,

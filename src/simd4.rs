@@ -1062,13 +1062,14 @@ pub mod avx512 {
     }
 
     /// 8-wide analog of [`super::avx2::chain_y_only`]: `8·K` keys per call.
-    /// `filter` drives the first-byte prefilter (see the `prefilter` feature);
-    /// it is ignored when that feature is off.
+    /// `filter = Some(..)` runs the first-byte prefilter (prefix search, see the
+    /// `prefilter` feature); `None` fully encodes every lane (e.g. suffix/run
+    /// search, where a leading-byte filter does not apply).
     #[target_feature(enable = "avx512f")]
     pub unsafe fn chain_y_only<const K: usize>(
         mut p: Point8,
         niels: &Niels8,
-        filter: &[(u8, u8)],
+        filter: Option<&[(u8, u8)]>,
         out: &mut [[[u8; 32]; 8]; K],
     ) -> Point8 {
         let mut ys = [p.y; K];
@@ -1091,39 +1092,38 @@ pub mod avx512 {
             inv = mul8(&inv, &zs[s]);
             let yz = mul8(&ys[s], &zinv);
 
-            // ---- first-byte prefilter (remove this block / the `prefilter`
-            //      feature to always fully encode every lane) ----
+            // First-byte prefilter (prefix-exact search only): byte0 = limb0 &
+            // 0xFF (higher limbs weigh 0 mod 256), the canonical first byte
+            // except for values in [p, 2^255) (~2^-250), so the filter is exact
+            // in practice. Survivors are encoded fully and matched exactly, so
+            // there are never false positives. `None` (suffix/run search, or
+            // the `prefilter` feature off) fully encodes every lane.
             #[cfg(feature = "prefilter")]
-            {
-                // byte0 = limb0 & 0xFF (higher limbs weigh 0 mod 256). This is
-                // the canonical first byte except when the value is in
-                // [p, 2^255) (~2^-250), so the filter is exact in practice and
-                // avoids a full canonical reduction here. Survivors are encoded
-                // exactly with fe_tobytes below, so results never have false
-                // positives.
-                let accept = firstbyte_accept_mask8(&yz, filter);
-                if accept != 0 {
+            let active_filter = filter;
+            #[cfg(not(feature = "prefilter"))]
+            let active_filter: Option<&[(u8, u8)]> = {
+                let _ = filter;
+                None
+            };
+
+            match active_filter {
+                Some(f) => {
+                    let accept = firstbyte_accept_mask8(&yz, f);
                     let lanes = store8(&yz);
                     for lane in 0..8 {
                         if accept & (1 << lane) != 0 {
                             out[s][lane] = super::fe_tobytes(&lanes[lane]);
                         } else {
+                            // 0x00 first byte -> should_skip() rejects it.
                             out[s][lane][0] = 0;
                         }
                     }
-                } else {
-                    for lane in 0..8 {
-                        // 0x00 first byte -> should_skip() rejects it.
-                        out[s][lane][0] = 0;
-                    }
                 }
-            }
-            #[cfg(not(feature = "prefilter"))]
-            {
-                let _ = filter;
-                let lanes = store8(&yz);
-                for lane in 0..8 {
-                    out[s][lane] = super::fe_tobytes(&lanes[lane]);
+                None => {
+                    let lanes = store8(&yz);
+                    for lane in 0..8 {
+                        out[s][lane] = super::fe_tobytes(&lanes[lane]);
+                    }
                 }
             }
         }
@@ -1435,7 +1435,8 @@ mod tests {
         };
         let mut out = [[[0u8; 32]; 8]; K];
         // (0, 0) accepts every byte0, so all lanes are fully encoded.
-        unsafe { avx512::chain_y_only::<K>(p8, &niels, &[(0u8, 0u8)], &mut out) };
+        // None = fully encode every lane (no prefilter), so all are checked.
+        unsafe { avx512::chain_y_only::<K>(p8, &niels, None, &mut out) };
         for lane in 0..8 {
             let mut cur = starts[lane];
             for s in 0..K {
