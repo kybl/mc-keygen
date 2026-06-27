@@ -18,6 +18,9 @@
 /// 1,3,5,7,9 hold 25 bits, all signed. This is the ref10 representation.
 pub type Fe = [i32; 10];
 
+/// The field element `1`.
+pub const FE_ONE: Fe = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
 #[inline]
 fn load3(b: &[u8]) -> i64 {
     (b[0] as i64) | ((b[1] as i64) << 8) | ((b[2] as i64) << 16)
@@ -187,6 +190,72 @@ pub fn fe_mul(f: &Fe, g: &Fe) -> Fe {
     core::array::from_fn(|i| h[i] as i32)
 }
 
+/// `h = f + g` (limb-wise; ref10 `fe_add`).
+pub fn fe_add(f: &Fe, g: &Fe) -> Fe {
+    core::array::from_fn(|i| f[i] + g[i])
+}
+
+/// `h = f - g` (limb-wise; ref10 `fe_sub`).
+pub fn fe_sub(f: &Fe, g: &Fe) -> Fe {
+    core::array::from_fn(|i| f[i] - g[i])
+}
+
+/// `h = f^2`.
+pub fn fe_sq(f: &Fe) -> Fe {
+    fe_mul(f, f)
+}
+
+/// `out = z^(p-2) = z^-1` via the ref10 addition chain.
+pub fn fe_invert(z: &Fe) -> Fe {
+    let mut t0 = fe_sq(z); // z^2
+    let mut t1 = fe_sq(&t0);
+    t1 = fe_sq(&t1); // z^8
+    t1 = fe_mul(z, &t1); // z^9
+    t0 = fe_mul(&t0, &t1); // z^11
+    let mut t2 = fe_sq(&t0); // z^22
+    t1 = fe_mul(&t1, &t2); // z^(2^5-1)
+    t2 = fe_sq(&t1);
+    for _ in 1..5 {
+        t2 = fe_sq(&t2);
+    }
+    t1 = fe_mul(&t2, &t1); // z^(2^10-1)
+    t2 = fe_sq(&t1);
+    for _ in 1..10 {
+        t2 = fe_sq(&t2);
+    }
+    t2 = fe_mul(&t2, &t1); // z^(2^20-1)
+    let mut t3 = fe_sq(&t2);
+    for _ in 1..20 {
+        t3 = fe_sq(&t3);
+    }
+    t2 = fe_mul(&t3, &t2); // z^(2^40-1)
+    t2 = fe_sq(&t2);
+    for _ in 1..10 {
+        t2 = fe_sq(&t2);
+    }
+    t1 = fe_mul(&t2, &t1); // z^(2^50-1)
+    t2 = fe_sq(&t1);
+    for _ in 1..50 {
+        t2 = fe_sq(&t2);
+    }
+    t2 = fe_mul(&t2, &t1); // z^(2^100-1)
+    t3 = fe_sq(&t2);
+    for _ in 1..100 {
+        t3 = fe_sq(&t3);
+    }
+    t2 = fe_mul(&t3, &t2); // z^(2^200-1)
+    t2 = fe_sq(&t2);
+    for _ in 1..50 {
+        t2 = fe_sq(&t2);
+    }
+    t1 = fe_mul(&t2, &t1); // z^(2^250-1)
+    t1 = fe_sq(&t1);
+    for _ in 1..5 {
+        t1 = fe_sq(&t1);
+    }
+    fe_mul(&t1, &t0)
+}
+
 // =====================================================================
 // AVX2 4-way (4 independent keys per call)
 // =====================================================================
@@ -352,6 +421,203 @@ pub mod avx2 {
         }
         out
     }
+
+    /// Broadcast one scalar field element into all four lanes.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn broadcast(fe: &Fe) -> Fe4 {
+        Fe4 {
+            l: core::array::from_fn(|i| _mm256_set1_epi64x(fe[i] as i64)),
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn add4(f: &Fe4, g: &Fe4) -> Fe4 {
+        Fe4 {
+            l: core::array::from_fn(|i| _mm256_add_epi64(f.l[i], g.l[i])),
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn sub4(f: &Fe4, g: &Fe4) -> Fe4 {
+        Fe4 {
+            l: core::array::from_fn(|i| _mm256_sub_epi64(f.l[i], g.l[i])),
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn sq4(f: &Fe4) -> Fe4 {
+        // A dedicated squaring saves muls; correctness-first uses mul4(x, x).
+        mul4(f, f)
+    }
+
+    /// A point in extended coordinates, four keys deep.
+    #[derive(Clone, Copy)]
+    pub struct Point4 {
+        pub x: Fe4,
+        pub y: Fe4,
+        pub z: Fe4,
+        pub t: Fe4,
+    }
+
+    /// A fixed `+step` addend in projective-niels form (same for all lanes).
+    #[derive(Clone, Copy)]
+    pub struct Niels4 {
+        pub yp: Fe4,
+        pub ym: Fe4,
+        pub z: Fe4,
+        pub t2d: Fe4,
+    }
+
+    /// `p + niels` via the dalek mixed-add formula (p3 + niels -> p1p1 -> p3).
+    /// Mirrors ref10/dalek exactly; the balanced (rounded) carry in `mul4`
+    /// keeps every intermediate within the `19*g < 2^31` tolerance, so no
+    /// extra reduction is needed.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn madd4(p: &Point4, n: &Niels4) -> Point4 {
+        let yp_x = add4(&p.y, &p.x);
+        let ym_x = sub4(&p.y, &p.x);
+        let pp = mul4(&yp_x, &n.yp);
+        let mm = mul4(&ym_x, &n.ym);
+        let tt2d = mul4(&p.t, &n.t2d);
+        let zz = mul4(&p.z, &n.z);
+        let zz2 = add4(&zz, &zz);
+        // completed point
+        let cx = sub4(&pp, &mm);
+        let cy = add4(&pp, &mm);
+        let cz = add4(&zz2, &tt2d);
+        let ct = sub4(&zz2, &tt2d);
+        // p1p1 -> p3
+        Point4 {
+            x: mul4(&cx, &ct),
+            y: mul4(&cy, &cz),
+            z: mul4(&cz, &ct),
+            t: mul4(&cx, &cy),
+        }
+    }
+
+    /// `out = z^-1` for four keys, sharing one addition chain across lanes.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn invert4(z: &Fe4) -> Fe4 {
+        let mut t0 = sq4(z);
+        let mut t1 = sq4(&t0);
+        t1 = sq4(&t1);
+        t1 = mul4(z, &t1);
+        t0 = mul4(&t0, &t1);
+        let mut t2 = sq4(&t0);
+        t1 = mul4(&t1, &t2);
+        t2 = sq4(&t1);
+        for _ in 1..5 {
+            t2 = sq4(&t2);
+        }
+        t1 = mul4(&t2, &t1);
+        t2 = sq4(&t1);
+        for _ in 1..10 {
+            t2 = sq4(&t2);
+        }
+        t2 = mul4(&t2, &t1);
+        let mut t3 = sq4(&t2);
+        for _ in 1..20 {
+            t3 = sq4(&t3);
+        }
+        t2 = mul4(&t3, &t2);
+        t2 = sq4(&t2);
+        for _ in 1..10 {
+            t2 = sq4(&t2);
+        }
+        t1 = mul4(&t2, &t1);
+        t2 = sq4(&t1);
+        for _ in 1..50 {
+            t2 = sq4(&t2);
+        }
+        t2 = mul4(&t2, &t1);
+        t3 = sq4(&t2);
+        for _ in 1..100 {
+            t3 = sq4(&t3);
+        }
+        t2 = mul4(&t3, &t2);
+        t2 = sq4(&t2);
+        for _ in 1..50 {
+            t2 = sq4(&t2);
+        }
+        t1 = mul4(&t2, &t1);
+        t1 = sq4(&t1);
+        for _ in 1..5 {
+            t1 = sq4(&t1);
+        }
+        mul4(&t1, &t0)
+    }
+
+    /// Build a `Point4` from four scalar points' extended coordinates.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn point4_from_xyzt(
+        x: &[Fe; 4],
+        y: &[Fe; 4],
+        z: &[Fe; 4],
+        t: &[Fe; 4],
+    ) -> Point4 {
+        Point4 {
+            x: load4(x),
+            y: load4(y),
+            z: load4(z),
+            t: load4(t),
+        }
+    }
+
+    /// Build the shared `+step` niels addend (broadcast to all lanes) from its
+    /// canonical bytes `(Y+X, Y-X, Z, T·2d)`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn niels4_from_bytes(nb: &[[u8; 32]; 4]) -> Niels4 {
+        Niels4 {
+            yp: broadcast(&super::fe_frombytes(&nb[0])),
+            ym: broadcast(&super::fe_frombytes(&nb[1])),
+            z: broadcast(&super::fe_frombytes(&nb[2])),
+            t2d: broadcast(&super::fe_frombytes(&nb[3])),
+        }
+    }
+
+    /// Walk `K` steps of `+step` from `p` across all four lanes, then y-only-
+    /// compress every visited point with one shared batch inversion. Returns
+    /// `out[s][lane]` = the y-encoding (sign bit zero) of `p + s·step` in lane
+    /// `lane`, plus the next base `p + K·step`. This is the SIMD analog of
+    /// `EdwardsPoint::chain_compress_y_only`, producing `4·K` keys per call.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn chain_y_only<const K: usize>(
+        mut p: Point4,
+        niels: &Niels4,
+        out: &mut [[[u8; 32]; 4]; K],
+    ) -> Point4 {
+        let mut ys = [p.y; K];
+        let mut zs = [p.z; K];
+        for s in 0..K {
+            ys[s] = p.y;
+            zs[s] = p.z;
+            p = madd4(&p, niels);
+        }
+
+        // Montgomery batch inversion of the K Z-values (4 lanes each).
+        let one = broadcast(&super::FE_ONE);
+        let mut prefix = [one; K];
+        let mut acc = one;
+        for s in 0..K {
+            prefix[s] = acc;
+            acc = mul4(&acc, &zs[s]);
+        }
+        let mut inv = invert4(&acc);
+
+        for s in (0..K).rev() {
+            let zinv = mul4(&inv, &prefix[s]);
+            inv = mul4(&inv, &zs[s]);
+            let yz = mul4(&ys[s], &zinv);
+            let lanes = store4(&yz);
+            for lane in 0..4 {
+                out[s][lane] = super::fe_tobytes(&lanes[lane]);
+            }
+        }
+        p
+    }
 }
 
 #[cfg(test)]
@@ -406,6 +672,150 @@ mod tests {
                 let got = fe_tobytes(&prod[k]);
                 let want = EdwardsPoint::field_mul_reference(&ab[k], &bb[k]);
                 assert_eq!(got, want, "mul4 lane {k} disagrees with dalek");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd_invert4_matches_dalek() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let one = {
+            let mut o = [0u8; 32];
+            o[0] = 1;
+            o
+        };
+        let mut st = 0xa1b2_c3d4_e5f6_0789;
+        for _ in 0..200 {
+            let xb: [[u8; 32]; 4] = core::array::from_fn(|_| rand_fe_bytes(&mut st));
+            let xf: [Fe; 4] = core::array::from_fn(|k| fe_frombytes(&xb[k]));
+            let prod = unsafe {
+                let x = avx2::load4(&xf);
+                let xi = avx2::invert4(&x);
+                avx2::store4(&avx2::mul4(&x, &xi))
+            };
+            for k in 0..4 {
+                assert_eq!(fe_tobytes(&prod[k]), one, "x * x^-1 != 1 in lane {k}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd_madd4_matches_dalek() {
+        use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
+        use curve25519_dalek::scalar::Scalar;
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let step = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
+        let nb = step.niels_bytes();
+        let niels = unsafe {
+            avx2::Niels4 {
+                yp: avx2::broadcast(&fe_frombytes(&nb[0])),
+                ym: avx2::broadcast(&fe_frombytes(&nb[1])),
+                z: avx2::broadcast(&fe_frombytes(&nb[2])),
+                t2d: avx2::broadcast(&fe_frombytes(&nb[3])),
+            }
+        };
+
+        let mut st = 0x5151_2323_9797_0001u64;
+        for _ in 0..200 {
+            let pts: [_; 4] = core::array::from_fn(|_| {
+                EdwardsPoint::mul_base_clamped({
+                    let mut s = rand_fe_bytes(&mut st);
+                    s[0] &= 248;
+                    s[31] = (s[31] & 63) | 64;
+                    s
+                })
+            });
+            let sums: [_; 4] = core::array::from_fn(|k| pts[k] + step);
+
+            let xyzt: [_; 4] = core::array::from_fn(|k| pts[k].xyzt_bytes());
+            let p4 = unsafe {
+                avx2::Point4 {
+                    x: avx2::load4(&core::array::from_fn(|k| fe_frombytes(&xyzt[k][0]))),
+                    y: avx2::load4(&core::array::from_fn(|k| fe_frombytes(&xyzt[k][1]))),
+                    z: avx2::load4(&core::array::from_fn(|k| fe_frombytes(&xyzt[k][2]))),
+                    t: avx2::load4(&core::array::from_fn(|k| fe_frombytes(&xyzt[k][3]))),
+                }
+            };
+            let (rx, ry, rz) = unsafe {
+                let r = avx2::madd4(&p4, &niels);
+                (avx2::store4(&r.x), avx2::store4(&r.y), avx2::store4(&r.z))
+            };
+
+            for k in 0..4 {
+                let exp = sums[k].xyzt_bytes();
+                let (ex, ey, ez) = (
+                    fe_frombytes(&exp[0]),
+                    fe_frombytes(&exp[1]),
+                    fe_frombytes(&exp[2]),
+                );
+                // Projective coords are unique only up to scale: cross-multiply.
+                assert_eq!(
+                    fe_tobytes(&fe_mul(&rx[k], &ez)),
+                    fe_tobytes(&fe_mul(&ex, &rz[k])),
+                    "madd4 X mismatch lane {k}"
+                );
+                assert_eq!(
+                    fe_tobytes(&fe_mul(&ry[k], &ez)),
+                    fe_tobytes(&fe_mul(&ey, &rz[k])),
+                    "madd4 Y mismatch lane {k}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd_chain_y_only_matches_dalek() {
+        use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
+        use curve25519_dalek::scalar::Scalar;
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        const K: usize = 8;
+        let step = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
+        let niels = unsafe { avx2::niels4_from_bytes(&step.niels_bytes()) };
+
+        let mut st = 0x7777_3333_dddd_0001u64;
+        let starts: [_; 4] = core::array::from_fn(|_| {
+            EdwardsPoint::mul_base_clamped({
+                let mut s = rand_fe_bytes(&mut st);
+                s[0] &= 248;
+                s[31] = (s[31] & 63) | 64;
+                s
+            })
+        });
+        let xyzt: [_; 4] = core::array::from_fn(|k| starts[k].xyzt_bytes());
+        let p4 = unsafe {
+            avx2::point4_from_xyzt(
+                &core::array::from_fn(|k| fe_frombytes(&xyzt[k][0])),
+                &core::array::from_fn(|k| fe_frombytes(&xyzt[k][1])),
+                &core::array::from_fn(|k| fe_frombytes(&xyzt[k][2])),
+                &core::array::from_fn(|k| fe_frombytes(&xyzt[k][3])),
+            )
+        };
+
+        let mut out = [[[0u8; 32]; 4]; K];
+        unsafe { avx2::chain_y_only::<K>(p4, &niels, &mut out) };
+
+        for lane in 0..4 {
+            let mut cur = starts[lane];
+            for s in 0..K {
+                let exp = cur.compress().to_bytes();
+                // y-only encoding: low 31 bytes match; sign bit (byte 31 high)
+                // is zeroed in the SIMD output.
+                assert_eq!(
+                    out[s][lane][..31],
+                    exp[..31],
+                    "chain_y_only mismatch lane {lane} step {s}"
+                );
+                assert_eq!(out[s][lane][31] & 0x80, 0);
+                cur += step;
             }
         }
     }

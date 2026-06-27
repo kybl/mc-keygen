@@ -4,6 +4,7 @@ mod gpu;
 #[cfg(feature = "metal")]
 mod metal_gpu;
 mod search;
+mod simd4;
 mod types;
 
 use std::io::{self, stdout};

@@ -225,23 +225,107 @@ fn spawn_cpu_bench_worker(
     matches: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if CHAIN_BATCH % 4 == 0 && std::is_x86_feature_detected!("avx2") {
+                // SAFETY: guarded by the runtime avx2 check.
+                unsafe { bench_worker_simd(&matchers, &stop, &keys, &matches) };
+                return;
+            }
+        }
+        bench_worker_scalar(&matchers, &stop, &keys, &matches);
+    })
+}
 
-        let mut scalar = [0u8; 32];
-        OsRng.fill_bytes(&mut scalar);
-        clamp_scalar(&mut scalar);
-        let mut point: EdwardsPoint = EdwardsPoint::mul_base_clamped(scalar);
+fn bench_worker_scalar(
+    matchers: &[PrefixMatcher],
+    stop: &AtomicBool,
+    keys: &AtomicU64,
+    matches: &AtomicU64,
+) {
+    let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
 
-        let mut local_keys: u64 = 0;
-        let mut local_matches: u64 = 0;
+    let mut scalar = [0u8; 32];
+    OsRng.fill_bytes(&mut scalar);
+    clamp_scalar(&mut scalar);
+    let mut point: EdwardsPoint = EdwardsPoint::mul_base_clamped(scalar);
 
-        while !stop.load(Ordering::Relaxed) {
-            // Mirror the real search hot loop: fused niels-chained +8B walk
-            // and y-only batch compression (sign multiply skipped, X/T dropped).
-            let (compressed, next_point) =
-                point.chain_compress_y_only::<CHAIN_BATCH>(&eight_b);
+    let mut local_keys: u64 = 0;
+    let mut local_matches: u64 = 0;
 
-            for public_key in compressed.iter() {
+    while !stop.load(Ordering::Relaxed) {
+        let (compressed, next_point) = point.chain_compress_y_only::<CHAIN_BATCH>(&eight_b);
+
+        for public_key in compressed.iter() {
+            if public_key[0] == 0x00 || public_key[0] == 0xFF {
+                continue;
+            }
+            if matchers.iter().any(|m| m.matches(public_key)) {
+                local_matches += 1;
+            }
+        }
+
+        local_keys += CHAIN_BATCH as u64;
+        if local_keys >= FLUSH_EVERY {
+            keys.fetch_add(local_keys, Ordering::Relaxed);
+            if local_matches > 0 {
+                matches.fetch_add(local_matches, Ordering::Relaxed);
+                local_matches = 0;
+            }
+            local_keys = 0;
+        }
+        point = next_point;
+        advance_scalar(&mut scalar, 8 * CHAIN_BATCH as u64);
+    }
+
+    keys.fetch_add(local_keys, Ordering::Relaxed);
+    if local_matches > 0 {
+        matches.fetch_add(local_matches, Ordering::Relaxed);
+    }
+}
+
+/// AVX2 bench worker: same SIMD hot loop as the real search, counting matches
+/// instead of exiting on the first one.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bench_worker_simd(
+    matchers: &[PrefixMatcher],
+    stop: &AtomicBool,
+    keys: &AtomicU64,
+    matches: &AtomicU64,
+) {
+    use crate::simd4::{avx2, fe_frombytes};
+
+    const K: usize = CHAIN_BATCH / 4;
+
+    let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
+    let niels = avx2::niels4_from_bytes(&eight_b.niels_bytes());
+
+    let mut scalars = [[0u8; 32]; 4];
+    for l in 0..4 {
+        OsRng.fill_bytes(&mut scalars[l]);
+        clamp_scalar(&mut scalars[l]);
+    }
+    let starts: [EdwardsPoint; 4] =
+        core::array::from_fn(|l| EdwardsPoint::mul_base_clamped(scalars[l]));
+    let xyzt: [_; 4] = core::array::from_fn(|l| starts[l].xyzt_bytes());
+    let mut p4 = avx2::point4_from_xyzt(
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][0])),
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][1])),
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][2])),
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][3])),
+    );
+
+    let mut out: Box<[[[u8; 32]; 4]; K]> = Box::new([[[0u8; 32]; 4]; K]);
+    let mut local_keys: u64 = 0;
+    let mut local_matches: u64 = 0;
+
+    while !stop.load(Ordering::Relaxed) {
+        p4 = avx2::chain_y_only::<K>(p4, &niels, &mut out);
+
+        for s in 0..K {
+            for lane in 0..4 {
+                let public_key = &out[s][lane];
                 if public_key[0] == 0x00 || public_key[0] == 0xFF {
                     continue;
                 }
@@ -249,25 +333,23 @@ fn spawn_cpu_bench_worker(
                     local_matches += 1;
                 }
             }
+        }
 
-            local_keys += CHAIN_BATCH as u64;
-            if local_keys >= FLUSH_EVERY {
-                keys.fetch_add(local_keys, Ordering::Relaxed);
-                if local_matches > 0 {
-                    matches.fetch_add(local_matches, Ordering::Relaxed);
-                    local_matches = 0;
-                }
-                local_keys = 0;
+        local_keys += CHAIN_BATCH as u64;
+        if local_keys >= FLUSH_EVERY {
+            keys.fetch_add(local_keys, Ordering::Relaxed);
+            if local_matches > 0 {
+                matches.fetch_add(local_matches, Ordering::Relaxed);
+                local_matches = 0;
             }
-            point = next_point;
-            advance_scalar(&mut scalar, 8 * CHAIN_BATCH as u64);
+            local_keys = 0;
         }
+    }
 
-        keys.fetch_add(local_keys, Ordering::Relaxed);
-        if local_matches > 0 {
-            matches.fetch_add(local_matches, Ordering::Relaxed);
-        }
-    })
+    keys.fetch_add(local_keys, Ordering::Relaxed);
+    if local_matches > 0 {
+        matches.fetch_add(local_matches, Ordering::Relaxed);
+    }
 }
 
 #[cfg(feature = "gpu")]

@@ -362,82 +362,176 @@ fn spawn_cpu_worker(
     result: Arc<Mutex<Option<MatchResult>>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
+        // On x86-64 with AVX2, scan four independent keys per step in SIMD
+        // lanes (radix-2^25.5 field, GPU-style). Falls back to the scalar
+        // chain otherwise.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if CHAIN_BATCH % 4 == 0 && std::is_x86_feature_detected!("avx2") {
+                // SAFETY: guarded by the runtime avx2 check above.
+                unsafe { cpu_worker_simd(&matchers, &found, &attempts, &result) };
+                return;
+            }
+        }
+        cpu_worker_scalar(&matchers, &found, &attempts, &result);
+    })
+}
 
-        let mut scalar = [0u8; 32];
-        OsRng.fill_bytes(&mut scalar);
-        clamp_scalar(&mut scalar);
-        let mut point: EdwardsPoint = EdwardsPoint::mul_base_clamped(scalar);
+/// Build the matched keypair (fresh random private-key prefix half), publish
+/// it, and flip the `found` flag.
+fn record_match(
+    matched_prefix: String,
+    public_key: [u8; 32],
+    match_scalar: [u8; 32],
+    found: &AtomicBool,
+    result: &Mutex<Option<MatchResult>>,
+) {
+    let mut prefix_half = [0u8; 32];
+    OsRng.fill_bytes(&mut prefix_half);
+    let mut private_key = [0u8; 64];
+    private_key[..32].copy_from_slice(&match_scalar);
+    private_key[32..].copy_from_slice(&prefix_half);
+    found.store(true, Ordering::Relaxed);
+    *result.lock().unwrap() = Some(MatchResult {
+        keypair: MeshCoreKeypair {
+            public_key,
+            private_key,
+        },
+        matched_prefix,
+    });
+}
 
-        // Number of attempts processed but not yet flushed to the shared atomic.
-        // Flushing every key would dominate at >1M keys/sec; we flush on
-        // BATCH_SIZE-aligned boundaries instead.
-        let mut local_count: u64 = 0;
+/// Scalar `+8B` chained-compress worker (portable fallback).
+fn cpu_worker_scalar(
+    matchers: &[(String, PrefixMatcher)],
+    found: &AtomicBool,
+    attempts: &AtomicU64,
+    result: &Mutex<Option<MatchResult>>,
+) {
+    let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
 
-        while !found.load(Ordering::Relaxed) {
-            // Walk batch_points[i] = point + i·8B and y-only-compress them in
-            // one fused pass: the niels form of 8B is derived once, only (Y,Z)
-            // per point is kept (X/T dropped), the per-point sign multiply is
-            // skipped, and one inversion is amortized across the batch.
-            // `next_point` = point + CHAIN_BATCH·8B is the next base. The prefix
-            // check reads only the low bytes (byte 31's sign bit is out of
-            // reach), so the zeroed sign bit is fine -- the true pubkey is
-            // recompressed on the rare hit below.
-            let (compressed, next_point) =
-                point.chain_compress_y_only::<CHAIN_BATCH>(&eight_b);
+    let mut scalar = [0u8; 32];
+    OsRng.fill_bytes(&mut scalar);
+    clamp_scalar(&mut scalar);
+    let mut point: EdwardsPoint = EdwardsPoint::mul_base_clamped(scalar);
 
-            for (i, public_key) in compressed.iter().enumerate() {
+    let mut local_count: u64 = 0;
+
+    while !found.load(Ordering::Relaxed) {
+        let (compressed, next_point) = point.chain_compress_y_only::<CHAIN_BATCH>(&eight_b);
+
+        for (i, public_key) in compressed.iter().enumerate() {
+            if should_skip(public_key) {
+                continue;
+            }
+            if let Some(matched) = matchers.iter().find(|(_, m)| m.matches(public_key)) {
+                let mut match_scalar = scalar;
+                advance_scalar(&mut match_scalar, 8 * i as u64);
+                // Sign bit was zeroed and full points weren't kept; recompute
+                // point + i·8B and compress it properly for the hit.
+                let mut hit_point = point;
+                for _ in 0..i {
+                    hit_point += eight_b;
+                }
+                let public_key = hit_point.compress().to_bytes();
+                attempts.fetch_add(local_count + i as u64 + 1, Ordering::Relaxed);
+                record_match(matched.0.clone(), public_key, match_scalar, found, result);
+                return;
+            }
+        }
+
+        local_count += CHAIN_BATCH as u64;
+        if local_count >= BATCH_SIZE {
+            attempts.fetch_add(local_count, Ordering::Relaxed);
+            local_count = 0;
+        }
+        point = next_point;
+        advance_scalar(&mut scalar, 8 * CHAIN_BATCH as u64);
+    }
+
+    attempts.fetch_add(local_count, Ordering::Relaxed);
+}
+
+/// AVX2 worker: four independent `+8B` chains advanced in SIMD lanes, scanning
+/// `4·(CHAIN_BATCH/4)` keys per batch with one shared 4-wide batch inversion.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn cpu_worker_simd(
+    matchers: &[(String, PrefixMatcher)],
+    found: &AtomicBool,
+    attempts: &AtomicU64,
+    result: &Mutex<Option<MatchResult>>,
+) {
+    use crate::simd4::{avx2, fe_frombytes};
+
+    const K: usize = CHAIN_BATCH / 4;
+
+    let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
+    // Each batch advances every lane by K steps of 8B.
+    let big_step = ED25519_BASEPOINT_TABLE * &Scalar::from((8 * K) as u64);
+    let niels = avx2::niels4_from_bytes(&eight_b.niels_bytes());
+
+    // Four independent random starting keys, one per lane.
+    let mut scalars = [[0u8; 32]; 4];
+    for l in 0..4 {
+        OsRng.fill_bytes(&mut scalars[l]);
+        clamp_scalar(&mut scalars[l]);
+    }
+    let mut starts: [EdwardsPoint; 4] =
+        core::array::from_fn(|l| EdwardsPoint::mul_base_clamped(scalars[l]));
+    let xyzt: [_; 4] = core::array::from_fn(|l| starts[l].xyzt_bytes());
+    let mut p4 = avx2::point4_from_xyzt(
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][0])),
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][1])),
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][2])),
+        &core::array::from_fn(|l| fe_frombytes(&xyzt[l][3])),
+    );
+
+    let mut out: Box<[[[u8; 32]; 4]; K]> = Box::new([[[0u8; 32]; 4]; K]);
+    let mut local_count: u64 = 0;
+
+    while !found.load(Ordering::Relaxed) {
+        p4 = avx2::chain_y_only::<K>(p4, &niels, &mut out);
+
+        for s in 0..K {
+            for lane in 0..4 {
+                let public_key = &out[s][lane];
                 if should_skip(public_key) {
                     continue;
                 }
-                if let Some(matched) = matchers.iter().find(|(_, m)| m.matches(public_key))
-                {
-                    let mut match_scalar = scalar;
-                    advance_scalar(&mut match_scalar, 8 * i as u64);
-
-                    // The scanned encoding has its sign bit zeroed and the full
-                    // points weren't kept; recompute this one point (point +
-                    // i·8B) and compress it properly (with sign) for the hit.
-                    let mut hit_point = point;
-                    for _ in 0..i {
-                        hit_point += eight_b;
+                if let Some(matched) = matchers.iter().find(|(_, m)| m.matches(public_key)) {
+                    let mut match_scalar = scalars[lane];
+                    advance_scalar(&mut match_scalar, 8 * s as u64);
+                    // Recompute the true signed pubkey for this lane/step from
+                    // the dalek start point kept in lockstep.
+                    let mut hit = starts[lane];
+                    for _ in 0..s {
+                        hit += eight_b;
                     }
-                    let public_key = hit_point.compress().to_bytes();
-
-                    // Prefix half of the expanded private key is just fresh
-                    // random bytes -- there's no derivation requirement on
-                    // it. One match per search, so a single OsRng draw is
-                    // fine. (Mirrors the GPU backends.)
-                    let mut prefix_half = [0u8; 32];
-                    OsRng.fill_bytes(&mut prefix_half);
-                    let mut private_key = [0u8; 64];
-                    private_key[..32].copy_from_slice(&match_scalar);
-                    private_key[32..].copy_from_slice(&prefix_half);
-
-                    attempts.fetch_add(local_count + i as u64 + 1, Ordering::Relaxed);
-                    found.store(true, Ordering::Relaxed);
-                    *result.lock().unwrap() = Some(MatchResult {
-                        keypair: MeshCoreKeypair {
-                            public_key,
-                            private_key,
-                        },
-                        matched_prefix: matched.0.clone(),
-                    });
+                    let public_key = hit.compress().to_bytes();
+                    attempts.fetch_add(
+                        local_count + (s * 4 + lane) as u64 + 1,
+                        Ordering::Relaxed,
+                    );
+                    record_match(matched.0.clone(), public_key, match_scalar, found, result);
                     return;
                 }
             }
-
-            local_count += CHAIN_BATCH as u64;
-            if local_count >= BATCH_SIZE {
-                attempts.fetch_add(local_count, Ordering::Relaxed);
-                local_count = 0;
-            }
-            point = next_point;
-            advance_scalar(&mut scalar, 8 * CHAIN_BATCH as u64);
         }
 
-        attempts.fetch_add(local_count, Ordering::Relaxed);
-    })
+        local_count += CHAIN_BATCH as u64;
+        if local_count >= BATCH_SIZE {
+            attempts.fetch_add(local_count, Ordering::Relaxed);
+            local_count = 0;
+        }
+        // Advance scalars and dalek start points in lockstep with p4.
+        for l in 0..4 {
+            advance_scalar(&mut scalars[l], 8 * K as u64);
+            starts[l] += big_step;
+        }
+    }
+
+    attempts.fetch_add(local_count, Ordering::Relaxed);
 }
 
 /// GPU dispatch loop shared by start_gpu and start_hybrid.

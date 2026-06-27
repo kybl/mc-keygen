@@ -684,6 +684,33 @@ impl EdwardsPoint {
         (&fa * &fb).to_bytes()
     }
 
+    /// Test/seed hook: the extended coordinates (X, Y, Z, T) as canonical
+    /// little-endian field-element bytes. Lets an external SIMD field load this
+    /// point. Not part of the stable public API.
+    #[doc(hidden)]
+    pub fn xyzt_bytes(&self) -> [[u8; 32]; 4] {
+        [
+            self.X.to_bytes(),
+            self.Y.to_bytes(),
+            self.Z.to_bytes(),
+            self.T.to_bytes(),
+        ]
+    }
+
+    /// Test/seed hook: this point's projective-niels coordinates
+    /// (Y+X, Y-X, Z, T·2d) as canonical bytes, for use as a fixed `+step`
+    /// addend by an external SIMD chain. Not part of the stable public API.
+    #[doc(hidden)]
+    pub fn niels_bytes(&self) -> [[u8; 32]; 4] {
+        let n = self.as_projective_niels();
+        [
+            n.Y_plus_X.to_bytes(),
+            n.Y_minus_X.to_bytes(),
+            n.Z.to_bytes(),
+            n.T2d.to_bytes(),
+        ]
+    }
+
     /// Compress several `EdwardsPoint`s into `CompressedEdwardsY` format, using a batch inversion
     /// for a significant speedup.
     #[cfg(feature = "alloc")]
