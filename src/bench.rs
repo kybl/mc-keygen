@@ -387,12 +387,14 @@ unsafe fn bench_worker_simd512(
         &core::array::from_fn(|l| fe_frombytes(&xyzt[l][3])),
     );
 
+    let filter: Vec<(u8, u8)> = matchers.iter().map(|m| m.first_byte_filter()).collect();
+
     let mut out: Box<[[[u8; 32]; 8]; K]> = Box::new([[[0u8; 32]; 8]; K]);
     let mut local_keys: u64 = 0;
     let mut local_matches: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        p8 = avx512::chain_y_only::<K>(p8, &niels, &mut out);
+        p8 = avx512::chain_y_only::<K>(p8, &niels, &filter, &mut out);
 
         for s in 0..K {
             for lane in 0..8 {

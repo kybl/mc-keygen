@@ -76,9 +76,10 @@ fn carry_scalar(h: &mut [i64; 10]) {
     c!(0, 26, 25);
 }
 
-/// Encode a field element to 32 canonical little-endian bytes (ref10
-/// `fe_tobytes`).
-pub fn fe_tobytes(h_in: &Fe) -> [u8; 32] {
+/// Reduce a field element to its canonical representative: non-negative limbs
+/// in radix-2^25.5, value in `[0, 2^255-19)`. This is the front half of ref10
+/// `fe_tobytes`; the back half is [`fe_pack`].
+pub fn fe_reduce_canonical(h_in: &Fe) -> Fe {
     let mut h = *h_in;
     let mut q = (19 * h[9] + (1 << 24)) >> 25;
     q = (h[0] + q) >> 26;
@@ -101,8 +102,12 @@ pub fn fe_tobytes(h_in: &Fe) -> [u8; 32] {
     }
     let carry9 = h[9] >> 25;
     h[9] -= carry9 << 25;
+    h
+}
 
-    let h: [i64; 10] = core::array::from_fn(|i| h[i] as i64);
+/// Pack canonical limbs (output of [`fe_reduce_canonical`]) into 32 bytes.
+pub fn fe_pack(h_in: &Fe) -> [u8; 32] {
+    let h: [i64; 10] = core::array::from_fn(|i| h_in[i] as i64);
     let mut s = [0u8; 32];
     s[0] = (h[0] >> 0) as u8;
     s[1] = (h[0] >> 8) as u8;
@@ -137,6 +142,12 @@ pub fn fe_tobytes(h_in: &Fe) -> [u8; 32] {
     s[30] = (h[9] >> 10) as u8;
     s[31] = (h[9] >> 18) as u8;
     s
+}
+
+/// Encode a field element to 32 canonical little-endian bytes (ref10
+/// `fe_tobytes` = reduce then pack).
+pub fn fe_tobytes(h: &Fe) -> [u8; 32] {
+    fe_pack(&fe_reduce_canonical(h))
 }
 
 /// Scalar ref10 field multiply `h = f * g mod (2^255 - 19)`. Reference and
@@ -988,11 +999,76 @@ pub mod avx512 {
         }
     }
 
+    // ===== first-byte prefilter helpers (feature = "prefilter") =====
+
+    /// Vectorized [`super::fe_reduce_canonical`]: reduce 8 field elements to
+    /// their canonical non-negative limbs at once.
+    #[cfg(feature = "prefilter")]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn canon8(yz: &Fe8) -> Fe8 {
+        let mut h = yz.l;
+        let r24 = _mm512_set1_epi64(1 << 24);
+        // q is computed across lanes in lockstep (each lane independent).
+        let mut q = _mm512_srai_epi64(_mm512_add_epi64(m19(h[9]), r24), 25);
+        macro_rules! qstep {
+            ($i:expr, $sh:expr) => {
+                q = _mm512_srai_epi64(_mm512_add_epi64(h[$i], q), $sh);
+            };
+        }
+        qstep!(0, 26);
+        qstep!(1, 25);
+        qstep!(2, 26);
+        qstep!(3, 25);
+        qstep!(4, 26);
+        qstep!(5, 25);
+        qstep!(6, 26);
+        qstep!(7, 25);
+        qstep!(8, 26);
+        qstep!(9, 25);
+        h[0] = _mm512_add_epi64(h[0], m19(q));
+        macro_rules! cstep {
+            ($i:expr, $sh:expr) => {{
+                let c = _mm512_srai_epi64(h[$i], $sh);
+                h[$i + 1] = _mm512_add_epi64(h[$i + 1], c);
+                h[$i] = _mm512_sub_epi64(h[$i], _mm512_slli_epi64(c, $sh));
+            }};
+        }
+        cstep!(0, 26);
+        cstep!(1, 25);
+        cstep!(2, 26);
+        cstep!(3, 25);
+        cstep!(4, 26);
+        cstep!(5, 25);
+        cstep!(6, 26);
+        cstep!(7, 25);
+        cstep!(8, 26);
+        let c9 = _mm512_srai_epi64(h[9], 25);
+        h[9] = _mm512_sub_epi64(h[9], _mm512_slli_epi64(c9, 25));
+        Fe8 { l: h }
+    }
+
+    /// 8-bit mask of lanes whose canonical first byte can match some prefix.
+    /// `filter[i] = (mask, value)`: lane passes if `byte0 & mask == value`.
+    #[cfg(feature = "prefilter")]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn firstbyte_accept_mask8(canon: &Fe8, filter: &[(u8, u8)]) -> u8 {
+        let b0 = _mm512_and_si512(canon.l[0], _mm512_set1_epi64(0xFF));
+        let mut accept: u8 = 0;
+        for &(mask, value) in filter {
+            let m = _mm512_and_si512(b0, _mm512_set1_epi64(mask as i64));
+            accept |= _mm512_cmpeq_epi64_mask(m, _mm512_set1_epi64(value as i64));
+        }
+        accept
+    }
+
     /// 8-wide analog of [`super::avx2::chain_y_only`]: `8·K` keys per call.
+    /// `filter` drives the first-byte prefilter (see the `prefilter` feature);
+    /// it is ignored when that feature is off.
     #[target_feature(enable = "avx512f")]
     pub unsafe fn chain_y_only<const K: usize>(
         mut p: Point8,
         niels: &Niels8,
+        filter: &[(u8, u8)],
         out: &mut [[[u8; 32]; 8]; K],
     ) -> Point8 {
         let mut ys = [p.y; K];
@@ -1014,9 +1090,31 @@ pub mod avx512 {
             let zinv = mul8(&inv, &prefix[s]);
             inv = mul8(&inv, &zs[s]);
             let yz = mul8(&ys[s], &zinv);
-            let lanes = store8(&yz);
-            for lane in 0..8 {
-                out[s][lane] = super::fe_tobytes(&lanes[lane]);
+
+            // ---- first-byte prefilter (remove this block / the `prefilter`
+            //      feature to always fully encode every lane) ----
+            #[cfg(feature = "prefilter")]
+            {
+                let canon = canon8(&yz);
+                let accept = firstbyte_accept_mask8(&canon, filter);
+                let lanes = store8(&canon);
+                for lane in 0..8 {
+                    if accept & (1 << lane) != 0 {
+                        out[s][lane] = super::fe_pack(&lanes[lane]);
+                    } else {
+                        // 0x00 first byte -> should_skip() rejects it; the rest
+                        // of out[s][lane] is left stale and never read.
+                        out[s][lane][0] = 0;
+                    }
+                }
+            }
+            #[cfg(not(feature = "prefilter"))]
+            {
+                let _ = filter;
+                let lanes = store8(&yz);
+                for lane in 0..8 {
+                    out[s][lane] = super::fe_tobytes(&lanes[lane]);
+                }
             }
         }
         p
@@ -1244,6 +1342,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_arch = "x86_64", feature = "prefilter"))]
+    fn simd_prefilter_canon_and_mask() {
+        if !is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        let mut st = 0xfeed_face_dead_0001u64;
+        for _ in 0..200 {
+            let xb: [[u8; 32]; 8] = core::array::from_fn(|_| rand_fe_bytes(&mut st));
+            let xf: [Fe; 8] = core::array::from_fn(|k| fe_frombytes(&xb[k]));
+            let canon = unsafe { avx512::canon8(&avx512::load8(&xf)) };
+            let canon_lanes = unsafe { avx512::store8(&canon) };
+            // canon8 + pack must reproduce the scalar canonical encoding.
+            for k in 0..8 {
+                assert_eq!(fe_pack(&canon_lanes[k]), fe_tobytes(&xf[k]), "canon8 lane {k}");
+            }
+            // Mask must accept exactly the lanes whose byte0 matches the filter.
+            let target = fe_tobytes(&xf[3])[0];
+            let mask = unsafe { avx512::firstbyte_accept_mask8(&canon, &[(0xFFu8, target)]) };
+            for k in 0..8 {
+                let expect = fe_tobytes(&xf[k])[0] == target;
+                assert_eq!((mask >> k) & 1 == 1, expect, "mask lane {k}");
+            }
+        }
+    }
+
+    #[test]
     #[cfg(target_arch = "x86_64")]
     fn simd_mul8_matches_dalek() {
         if !is_x86_feature_detected!("avx512f") {
@@ -1300,7 +1424,8 @@ mod tests {
             )
         };
         let mut out = [[[0u8; 32]; 8]; K];
-        unsafe { avx512::chain_y_only::<K>(p8, &niels, &mut out) };
+        // (0, 0) accepts every byte0, so all lanes are fully encoded.
+        unsafe { avx512::chain_y_only::<K>(p8, &niels, &[(0u8, 0u8)], &mut out) };
         for lane in 0..8 {
             let mut cur = starts[lane];
             for s in 0..K {

@@ -7,7 +7,12 @@ description = "MeshCore vanity Ed25519 key generator"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = []
+default = ["prefilter"]
+# First-byte SIMD prefilter in the AVX-512 search path: only fully encode
+# candidate keys whose canonical first byte can match a wanted prefix. Pure
+# speed optimization, exact results. Disable with `--no-default-features`
+# (e.g. if you match keys some other way than a leading hex prefix).
+prefilter = []
 # Umbrella feature implied by any GPU backend. Use for `#[cfg(feature = "gpu")]`
 # on code that's relevant to GPU search but not tied to a specific backend.
 gpu = []

@@ -137,6 +137,20 @@ impl PrefixMatcher {
 
         true
     }
+
+    /// `(mask, value)` for a first-byte prefilter: a public key can match this
+    /// prefix only if `public_key[0] & mask == value`. Used to cheaply reject
+    /// most candidates in SIMD before full encoding.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub fn first_byte_filter(&self) -> (u8, u8) {
+        if let Some(&b) = self.full_bytes.first() {
+            (0xFF, b)
+        } else {
+            // No full byte means the prefix is a single nibble.
+            let n = self.trailing_nibble.expect("prefix has at least one nibble");
+            (0xF0, n << 4)
+        }
+    }
 }
 
 fn nibble_from_ascii(c: u8) -> u8 {
@@ -572,11 +586,13 @@ unsafe fn cpu_worker_simd512(
         &core::array::from_fn(|l| fe_frombytes(&xyzt[l][3])),
     );
 
+    let filter: Vec<(u8, u8)> = matchers.iter().map(|(_, m)| m.first_byte_filter()).collect();
+
     let mut out: Box<[[[u8; 32]; 8]; K]> = Box::new([[[0u8; 32]; 8]; K]);
     let mut local_count: u64 = 0;
 
     while !found.load(Ordering::Relaxed) {
-        p8 = avx512::chain_y_only::<K>(p8, &niels, &mut out);
+        p8 = avx512::chain_y_only::<K>(p8, &niels, &filter, &mut out);
 
         for s in 0..K {
             for lane in 0..8 {
