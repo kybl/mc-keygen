@@ -23,7 +23,7 @@ use ratatui::{
 
 use std::sync::Arc;
 
-use search::{SearchHandle, Target};
+use search::{SearchHandle, StreamHandle, Target};
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +57,12 @@ struct Cli {
     /// Output result as JSON
     #[arg(long)]
     json: bool,
+
+    /// Run forever: print every match to stdout (one line each) and keep
+    /// searching instead of stopping at the first hit. Pipe to a file to
+    /// collect matches over days, e.g. `mc-keygen ABC --stream > keys.txt`.
+    #[arg(long)]
+    stream: bool,
 
     /// Force CPU-only search (no GPU even if available)
     #[cfg(feature = "gpu")]
@@ -332,6 +338,39 @@ fn run_tui_loop(
     Ok(result)
 }
 
+/// Run-forever streaming search: spawn workers and print every match to
+/// stdout as it arrives, flushing each line so a redirected file stays current
+/// even if the run is killed days later.
+///
+/// Non-JSON output is one tab-separated line per match:
+///     <matched>\t<public_key>\t<private_key>
+/// With `--json` each line is a standalone JSON object (JSON Lines).
+fn run_stream(target: Arc<Target>, num_threads: usize, search_desc: &str, json: bool) {
+    use std::io::Write;
+
+    let handle = StreamHandle::start(target, num_threads);
+
+    // Status goes to stderr so stdout carries only result data.
+    eprintln!(
+        "Streaming matches for {} on {} threads. Each hit is printed to stdout; press Ctrl+C to stop.",
+        search_desc, num_threads
+    );
+
+    let stdout = io::stdout();
+    while let Some(r) = handle.next_match() {
+        let mut out = stdout.lock();
+        let line = if json {
+            serde_json::to_string(&r).unwrap()
+        } else {
+            format!("{}\t{}\t{}", r.matched_prefix, r.public_key, r.private_key)
+        };
+        // If stdout is gone (pipe closed), stop quietly.
+        if writeln!(out, "{}", line).is_err() || out.flush().is_err() {
+            break;
+        }
+    }
+}
+
 fn print_colored_result(result: &types::SearchResult) {
     use crossterm::style::{self, Stylize};
 
@@ -491,6 +530,18 @@ fn main() {
         WhereArg::Suffix => "suffix",
     };
     let search_desc = format!("{} [{}]", what_desc, where_desc);
+
+    // Run-forever streaming mode: CPU-only, no TUI. Print every match to
+    // stdout as it's found and keep going until the process is killed.
+    if cli.stream {
+        let num_threads = cli.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
+        run_stream(Arc::clone(&target), num_threads, &search_desc, cli.json);
+        return;
+    }
 
     #[cfg(feature = "gpu")]
     let cpu_only = cli.cpu_only;

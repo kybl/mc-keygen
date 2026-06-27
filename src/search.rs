@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -374,6 +375,36 @@ struct MatchResult {
     matched_prefix: String,
 }
 
+/// Where a worker reports a match.
+///
+/// `OneShot` stores the first match and flips the stop flag (the classic
+/// "find one key and exit" behaviour). `Stream` forwards every match over a
+/// channel and lets the worker keep scanning, for the run-forever mode.
+enum Sink {
+    OneShot {
+        stop: Arc<AtomicBool>,
+        result: Arc<Mutex<Option<MatchResult>>>,
+    },
+    Stream {
+        tx: mpsc::Sender<MatchResult>,
+    },
+}
+
+impl Sink {
+    /// Report a match. Returns `true` if the worker should stop scanning
+    /// (first hit in one-shot mode, or the stream receiver has hung up).
+    fn emit(&self, m: MatchResult) -> bool {
+        match self {
+            Sink::OneShot { stop, result } => {
+                stop.store(true, Ordering::Relaxed);
+                *result.lock().unwrap() = Some(m);
+                true
+            }
+            Sink::Stream { tx } => tx.send(m).is_err(),
+        }
+    }
+}
+
 /// Handle for a running vanity key search.
 /// Exposes atomics so a TUI render loop can poll progress directly.
 pub struct SearchHandle {
@@ -397,7 +428,10 @@ impl SearchHandle {
                 Arc::clone(&target),
                 Arc::clone(&found),
                 Arc::clone(&attempts),
-                Arc::clone(&result),
+                Sink::OneShot {
+                    stop: Arc::clone(&found),
+                    result: Arc::clone(&result),
+                },
             ));
         }
 
@@ -500,7 +534,10 @@ impl SearchHandle {
                 Arc::clone(&target),
                 Arc::clone(&found),
                 Arc::clone(&attempts),
-                Arc::clone(&result),
+                Sink::OneShot {
+                    stop: Arc::clone(&found),
+                    result: Arc::clone(&result),
+                },
             ));
         }
 
@@ -550,9 +587,9 @@ const CHAIN_BATCH: usize = 512;
 /// goes from ~265 fe_muls (one full `compress`) to ~20 (batched).
 fn spawn_cpu_worker(
     target: Arc<Target>,
-    found: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     attempts: Arc<AtomicU64>,
-    result: Arc<Mutex<Option<MatchResult>>>,
+    sink: Sink,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         // On x86-64 with AVX2, scan four independent keys per step in SIMD
@@ -562,49 +599,45 @@ fn spawn_cpu_worker(
         {
             if CHAIN_BATCH % 8 == 0 && std::is_x86_feature_detected!("avx512f") {
                 // SAFETY: guarded by the runtime avx512f check.
-                unsafe { cpu_worker_simd512(&target, &found, &attempts, &result) };
+                unsafe { cpu_worker_simd512(&target, &stop, &attempts, &sink) };
                 return;
             }
             if CHAIN_BATCH % 4 == 0 && std::is_x86_feature_detected!("avx2") {
                 // SAFETY: guarded by the runtime avx2 check above.
-                unsafe { cpu_worker_simd(&target, &found, &attempts, &result) };
+                unsafe { cpu_worker_simd(&target, &stop, &attempts, &sink) };
                 return;
             }
         }
-        cpu_worker_scalar(&target, &found, &attempts, &result);
+        cpu_worker_scalar(&target, &stop, &attempts, &sink);
     })
 }
 
-/// Build the matched keypair (fresh random private-key prefix half), publish
-/// it, and flip the `found` flag.
-fn record_match(
+/// Build the matched keypair with a fresh random private-key prefix half.
+fn build_match(
     matched_prefix: String,
     public_key: [u8; 32],
     match_scalar: [u8; 32],
-    found: &AtomicBool,
-    result: &Mutex<Option<MatchResult>>,
-) {
+) -> MatchResult {
     let mut prefix_half = [0u8; 32];
     OsRng.fill_bytes(&mut prefix_half);
     let mut private_key = [0u8; 64];
     private_key[..32].copy_from_slice(&match_scalar);
     private_key[32..].copy_from_slice(&prefix_half);
-    found.store(true, Ordering::Relaxed);
-    *result.lock().unwrap() = Some(MatchResult {
+    MatchResult {
         keypair: MeshCoreKeypair {
             public_key,
             private_key,
         },
         matched_prefix,
-    });
+    }
 }
 
 /// Scalar `+8B` chained-compress worker (portable fallback).
 fn cpu_worker_scalar(
     target: &Target,
-    found: &AtomicBool,
+    stop: &AtomicBool,
     attempts: &AtomicU64,
-    result: &Mutex<Option<MatchResult>>,
+    sink: &Sink,
 ) {
     let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
 
@@ -615,7 +648,7 @@ fn cpu_worker_scalar(
 
     let mut local_count: u64 = 0;
 
-    while !found.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) {
         let (compressed, next_point) = point.chain_compress_y_only::<CHAIN_BATCH>(&eight_b);
 
         for (i, public_key) in compressed.iter().enumerate() {
@@ -632,9 +665,13 @@ fn cpu_worker_scalar(
             if let Some(label) = target.authoritative(&real) {
                 let mut match_scalar = scalar;
                 advance_scalar(&mut match_scalar, 8 * i as u64);
-                attempts.fetch_add(local_count + i as u64 + 1, Ordering::Relaxed);
-                record_match(label, real, match_scalar, found, result);
-                return;
+                let m = build_match(label, real, match_scalar);
+                // In stream mode the per-match count is rolled into the batch
+                // accounting below; only one-shot needs an exact final tally.
+                if sink.emit(m) {
+                    attempts.fetch_add(local_count + i as u64 + 1, Ordering::Relaxed);
+                    return;
+                }
             }
         }
 
@@ -656,9 +693,9 @@ fn cpu_worker_scalar(
 #[target_feature(enable = "avx2")]
 unsafe fn cpu_worker_simd(
     target: &Target,
-    found: &AtomicBool,
+    stop: &AtomicBool,
     attempts: &AtomicU64,
-    result: &Mutex<Option<MatchResult>>,
+    sink: &Sink,
 ) {
     use crate::simd4::{avx2, fe_frombytes};
 
@@ -688,7 +725,7 @@ unsafe fn cpu_worker_simd(
     let mut out: Box<[[[u8; 32]; 4]; K]> = Box::new([[[0u8; 32]; 4]; K]);
     let mut local_count: u64 = 0;
 
-    while !found.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) {
         p4 = avx2::chain_y_only::<K>(p4, &niels, &mut out);
 
         for s in 0..K {
@@ -705,12 +742,14 @@ unsafe fn cpu_worker_simd(
                 if let Some(label) = target.authoritative(&real) {
                     let mut match_scalar = scalars[lane];
                     advance_scalar(&mut match_scalar, 8 * s as u64);
-                    attempts.fetch_add(
-                        local_count + (s * 4 + lane) as u64 + 1,
-                        Ordering::Relaxed,
-                    );
-                    record_match(label, real, match_scalar, found, result);
-                    return;
+                    let m = build_match(label, real, match_scalar);
+                    if sink.emit(m) {
+                        attempts.fetch_add(
+                            local_count + (s * 4 + lane) as u64 + 1,
+                            Ordering::Relaxed,
+                        );
+                        return;
+                    }
                 }
             }
         }
@@ -736,9 +775,9 @@ unsafe fn cpu_worker_simd(
 #[target_feature(enable = "avx512f")]
 unsafe fn cpu_worker_simd512(
     target: &Target,
-    found: &AtomicBool,
+    stop: &AtomicBool,
     attempts: &AtomicU64,
-    result: &Mutex<Option<MatchResult>>,
+    sink: &Sink,
 ) {
     use crate::simd4::{avx512, fe_frombytes};
 
@@ -770,7 +809,7 @@ unsafe fn cpu_worker_simd512(
     let mut out: Box<[[[u8; 32]; 8]; K]> = Box::new([[[0u8; 32]; 8]; K]);
     let mut local_count: u64 = 0;
 
-    while !found.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) {
         p8 = avx512::chain_y_only::<K>(p8, &niels, filter.as_deref(), &mut out);
 
         for s in 0..K {
@@ -787,12 +826,14 @@ unsafe fn cpu_worker_simd512(
                 if let Some(label) = target.authoritative(&real) {
                     let mut match_scalar = scalars[lane];
                     advance_scalar(&mut match_scalar, 8 * s as u64);
-                    attempts.fetch_add(
-                        local_count + (s * 8 + lane) as u64 + 1,
-                        Ordering::Relaxed,
-                    );
-                    record_match(label, real, match_scalar, found, result);
-                    return;
+                    let m = build_match(label, real, match_scalar);
+                    if sink.emit(m) {
+                        attempts.fetch_add(
+                            local_count + (s * 8 + lane) as u64 + 1,
+                            Ordering::Relaxed,
+                        );
+                        return;
+                    }
                 }
             }
         }
@@ -809,6 +850,90 @@ unsafe fn cpu_worker_simd512(
     }
 
     attempts.fetch_add(local_count, Ordering::Relaxed);
+}
+
+/// Handle for a run-forever streaming search.
+///
+/// Workers never stop on a match; instead every hit is pushed over a channel.
+/// The caller drains [`StreamHandle::next_match`] and does whatever it likes
+/// with each result (print it, append to a file, ...). The search runs until
+/// [`StreamHandle::stop`] is called or the handle is dropped.
+pub struct StreamHandle {
+    stop: Arc<AtomicBool>,
+    attempts: Arc<AtomicU64>,
+    rx: mpsc::Receiver<MatchResult>,
+    start: Instant,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl StreamHandle {
+    /// Start a streaming CPU search across `num_threads` worker threads.
+    pub fn start(target: Arc<Target>, num_threads: usize) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel();
+
+        let mut workers = Vec::with_capacity(num_threads);
+        for _ in 0..num_threads {
+            workers.push(spawn_cpu_worker(
+                Arc::clone(&target),
+                Arc::clone(&stop),
+                Arc::clone(&attempts),
+                Sink::Stream { tx: tx.clone() },
+            ));
+        }
+        // Drop our own sender so `rx` disconnects once every worker exits.
+        drop(tx);
+
+        StreamHandle {
+            stop,
+            attempts,
+            rx,
+            start: Instant::now(),
+            workers,
+        }
+    }
+
+    /// Block until the next match arrives. Returns `None` once all workers
+    /// have stopped (e.g. after [`StreamHandle::stop`]).
+    pub fn next_match(&self) -> Option<SearchResult> {
+        let m = self.rx.recv().ok()?;
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let attempts = self.attempts.load(Ordering::Relaxed);
+        Some(SearchResult {
+            public_key: hex::encode_upper(m.keypair.public_key),
+            private_key: hex::encode_upper(m.keypair.private_key),
+            matched_prefix: m.matched_prefix,
+            attempts,
+            elapsed_secs: elapsed,
+        })
+    }
+
+    /// Current search statistics (keys checked, rate, elapsed).
+    #[allow(dead_code)]
+    pub fn stats(&self, expected: u64) -> SearchStats {
+        let attempts = self.attempts.load(Ordering::Relaxed);
+        let elapsed = self.start.elapsed().as_secs_f64();
+        SearchStats {
+            attempts,
+            expected_attempts: expected,
+            elapsed_secs: elapsed,
+            keys_per_sec: if elapsed > 0.0 {
+                attempts as f64 / elapsed
+            } else {
+                0.0
+            },
+        }
+    }
+
+    /// Signal all workers to stop and join them.
+    #[allow(dead_code)]
+    pub fn stop(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for h in self.workers {
+            h.join().unwrap();
+        }
+    }
 }
 
 /// GPU dispatch loop shared by start_gpu and start_hybrid.

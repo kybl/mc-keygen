@@ -11,6 +11,7 @@ mc-keygen <PREFIX>... [OPTIONS]
 **Options:**
 - `-t, --threads <N>` — worker threads (default: all cores)
 - `--json` — output result as JSON (no TUI, no color)
+- `--stream` — run forever: print every match to stdout (one per line) and keep searching instead of stopping at the first hit. CPU-only, no TUI. Ideal for leaving a long search running on a server and collecting all results later (redirect stdout to a file).
 - `--cpu-only` — force CPU-only search, skip GPU even if available (requires `cuda` or `metal` feature)
 - `--gpu-only` — force GPU-only search, no CPU threads (requires `cuda` or `metal` feature)
 - `--verify` — cross-check GPU keygen against CPU (requires `cuda` or `metal` feature)
@@ -26,7 +27,26 @@ mc-keygen DEAD -t 4      # use 4 threads
 mc-keygen AB --json      # machine-readable output
 mc-keygen ABCDEF --gpu-only   # GPU only for longer prefixes
 mc-keygen AB --cpu-only       # force CPU even when GPU is available
+mc-keygen ABCD --stream > keys.txt &   # run for days, collect every match in a file
 ```
+
+### Streaming mode (`--stream`)
+
+By default the search stops at the first match. With `--stream` it never stops: every matching key is written to stdout the moment it's found and the search keeps running until you kill it (Ctrl+C). This is meant for "start it on a server, come back in a week, read all the results":
+
+```bash
+nohup mc-keygen ABCD --stream > keys.txt 2>log.txt &
+# ... days later ...
+cat keys.txt    # every key found so far
+```
+
+Output is one line per match, tab-separated:
+
+```
+<matched>	<public_key>	<private_key>
+```
+
+With `--stream --json` each line is a standalone JSON object (JSON Lines) instead. Each line is flushed immediately, so the file is always up to date even if the process is killed.
 
 Multiple prefixes can be passed in a single invocation — every key is checked against all of them, so searching for N prefixes is ~N× more efficient than N separate runs. The JSON output includes a `matched_prefix` field.
 
