@@ -1095,15 +1095,25 @@ pub mod avx512 {
             //      feature to always fully encode every lane) ----
             #[cfg(feature = "prefilter")]
             {
-                let canon = canon8(&yz);
-                let accept = firstbyte_accept_mask8(&canon, filter);
-                let lanes = store8(&canon);
-                for lane in 0..8 {
-                    if accept & (1 << lane) != 0 {
-                        out[s][lane] = super::fe_pack(&lanes[lane]);
-                    } else {
-                        // 0x00 first byte -> should_skip() rejects it; the rest
-                        // of out[s][lane] is left stale and never read.
+                // byte0 = limb0 & 0xFF (higher limbs weigh 0 mod 256). This is
+                // the canonical first byte except when the value is in
+                // [p, 2^255) (~2^-250), so the filter is exact in practice and
+                // avoids a full canonical reduction here. Survivors are encoded
+                // exactly with fe_tobytes below, so results never have false
+                // positives.
+                let accept = firstbyte_accept_mask8(&yz, filter);
+                if accept != 0 {
+                    let lanes = store8(&yz);
+                    for lane in 0..8 {
+                        if accept & (1 << lane) != 0 {
+                            out[s][lane] = super::fe_tobytes(&lanes[lane]);
+                        } else {
+                            out[s][lane][0] = 0;
+                        }
+                    }
+                } else {
+                    for lane in 0..8 {
+                        // 0x00 first byte -> should_skip() rejects it.
                         out[s][lane][0] = 0;
                     }
                 }
