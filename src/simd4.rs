@@ -1003,7 +1003,6 @@ pub mod avx512 {
 
     /// Vectorized [`super::fe_reduce_canonical`]: reduce 8 field elements to
     /// their canonical non-negative limbs at once.
-    #[cfg(feature = "prefilter")]
     #[target_feature(enable = "avx512f")]
     pub unsafe fn canon8(yz: &Fe8) -> Fe8 {
         let mut h = yz.l;
@@ -1049,7 +1048,6 @@ pub mod avx512 {
 
     /// 8-bit mask of lanes whose canonical first byte can match some prefix.
     /// `filter[i] = (mask, value)`: lane passes if `byte0 & mask == value`.
-    #[cfg(feature = "prefilter")]
     #[target_feature(enable = "avx512f")]
     pub unsafe fn firstbyte_accept_mask8(canon: &Fe8, filter: &[(u8, u8)]) -> u8 {
         let b0 = _mm512_and_si512(canon.l[0], _mm512_set1_epi64(0xFF));
@@ -1062,9 +1060,9 @@ pub mod avx512 {
     }
 
     /// 8-wide analog of [`super::avx2::chain_y_only`]: `8·K` keys per call.
-    /// `filter = Some(..)` runs the first-byte prefilter (prefix search, see the
-    /// `prefilter` feature); `None` fully encodes every lane (e.g. suffix/run
-    /// search, where a leading-byte filter does not apply).
+    /// `filter = Some(..)` runs the exact first-byte prefilter (prefix search);
+    /// `None` fully encodes every lane (e.g. suffix/run search, where a
+    /// leading-byte filter does not apply).
     #[target_feature(enable = "avx512f")]
     pub unsafe fn chain_y_only<const K: usize>(
         mut p: Point8,
@@ -1092,29 +1090,20 @@ pub mod avx512 {
             inv = mul8(&inv, &zs[s]);
             let yz = mul8(&ys[s], &zinv);
 
-            // First-byte prefilter (prefix-exact search only): byte0 = limb0 &
-            // 0xFF (higher limbs weigh 0 mod 256), the canonical first byte
-            // except for values in [p, 2^255) (~2^-250), so the filter is exact
-            // in practice. Survivors are encoded fully and matched exactly, so
-            // there are never false positives. `None` (suffix/run search, or
-            // the `prefilter` feature off) fully encodes every lane.
-            #[cfg(feature = "prefilter")]
-            let active_filter = filter;
-            #[cfg(not(feature = "prefilter"))]
-            let active_filter: Option<&[(u8, u8)]> = {
-                let _ = filter;
-                None
-            };
-
-            match active_filter {
+            // First-byte prefilter (prefix-exact search only): canonicalize all
+            // 8 lanes once, read byte 0 exactly, and fully encode only the lanes
+            // whose first byte can match a wanted prefix; the rest get a 0x00
+            // first byte that should_skip() drops. Exact -- no false negatives
+            // or positives. `None` (suffix/run search) fully encodes every lane.
+            match filter {
                 Some(f) => {
-                    let accept = firstbyte_accept_mask8(&yz, f);
-                    let lanes = store8(&yz);
+                    let canon = canon8(&yz);
+                    let accept = firstbyte_accept_mask8(&canon, f);
+                    let lanes = store8(&canon);
                     for lane in 0..8 {
                         if accept & (1 << lane) != 0 {
-                            out[s][lane] = super::fe_tobytes(&lanes[lane]);
+                            out[s][lane] = super::fe_pack(&lanes[lane]);
                         } else {
-                            // 0x00 first byte -> should_skip() rejects it.
                             out[s][lane][0] = 0;
                         }
                     }
@@ -1352,7 +1341,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(target_arch = "x86_64", feature = "prefilter"))]
+    #[cfg(target_arch = "x86_64")]
     fn simd_prefilter_canon_and_mask() {
         if !is_x86_feature_detected!("avx512f") {
             return;
