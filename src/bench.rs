@@ -27,7 +27,7 @@ const SCHEMA_VERSION: u32 = 2;
 /// Number of points compressed under one batched inversion. Mirrors
 /// `CHAIN_BATCH` in src/search.rs so the bench worker measures the same hot
 /// loop the real search uses.
-const CHAIN_BATCH: usize = 256;
+const CHAIN_BATCH: usize = 512;
 
 /// Per-worker flush threshold for atomic counter updates. Keeping it batched
 /// avoids dominating the loop with cache-line contention at >1 MH/s.

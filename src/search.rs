@@ -340,7 +340,7 @@ impl SearchHandle {
 /// (the per-point `+8B` add becomes the floor) while stack/cache footprint
 /// keeps growing — the batch holds `CHAIN_BATCH` EdwardsPoints (~160 B each)
 /// plus scratch — so 256 sits at the knee of the curve.
-const CHAIN_BATCH: usize = 256;
+const CHAIN_BATCH: usize = 512;
 
 /// Spawn one CPU worker thread that scans via a `+8B` chain with
 /// Montgomery batched compression.
