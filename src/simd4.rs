@@ -18,6 +18,30 @@
 /// 1,3,5,7,9 hold 25 bits, all signed. This is the ref10 representation.
 pub type Fe = [i32; 10];
 
+/// Which byte of the encoded key a kernel prefilter tests.
+///
+/// `First` is byte 0 (prefix searches); `Last` is byte 31 with the sign bit
+/// zeroed (suffix searches — the y-only encoding never carries the sign bit,
+/// so only 7 bits of byte 31 are comparable).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FilterByte {
+    First,
+    Last,
+}
+
+/// Assemble one lane's 32-byte key from vectorized bit-packing output
+/// (`[word][lane]`, four little-endian u64 words per lane).
+#[inline(always)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn lane_bytes<const N: usize>(w: &[[u64; N]; 4], lane: usize) -> [u8; 32] {
+    let mut k = [0u8; 32];
+    k[0..8].copy_from_slice(&w[0][lane].to_le_bytes());
+    k[8..16].copy_from_slice(&w[1][lane].to_le_bytes());
+    k[16..24].copy_from_slice(&w[2][lane].to_le_bytes());
+    k[24..32].copy_from_slice(&w[3][lane].to_le_bytes());
+    k
+}
+
 /// The field element `1`.
 pub const FE_ONE: Fe = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
@@ -634,15 +658,116 @@ pub mod avx2 {
         }
     }
 
+    /// Vectorized [`super::fe_reduce_canonical`] for four lanes: mirror of
+    /// [`super::avx512::canon8`] using the emulated 64-bit arithmetic shift.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn canon4(yz: &Fe4) -> Fe4 {
+        let mut h = yz.l;
+        let r24 = _mm256_set1_epi64x(1 << 24);
+        let mut q = srai64::<25>(_mm256_add_epi64(m19(h[9]), r24));
+        macro_rules! qstep {
+            ($i:expr, $sh:expr) => {
+                q = srai64::<$sh>(_mm256_add_epi64(h[$i], q));
+            };
+        }
+        qstep!(0, 26);
+        qstep!(1, 25);
+        qstep!(2, 26);
+        qstep!(3, 25);
+        qstep!(4, 26);
+        qstep!(5, 25);
+        qstep!(6, 26);
+        qstep!(7, 25);
+        qstep!(8, 26);
+        qstep!(9, 25);
+        h[0] = _mm256_add_epi64(h[0], m19(q));
+        macro_rules! cstep {
+            ($i:expr, $sh:expr) => {{
+                let c = srai64::<$sh>(h[$i]);
+                h[$i + 1] = _mm256_add_epi64(h[$i + 1], c);
+                h[$i] = _mm256_sub_epi64(h[$i], _mm256_slli_epi64(c, $sh));
+            }};
+        }
+        cstep!(0, 26);
+        cstep!(1, 25);
+        cstep!(2, 26);
+        cstep!(3, 25);
+        cstep!(4, 26);
+        cstep!(5, 25);
+        cstep!(6, 26);
+        cstep!(7, 25);
+        cstep!(8, 26);
+        let c9 = srai64::<25>(h[9]);
+        h[9] = _mm256_sub_epi64(h[9], _mm256_slli_epi64(c9, 25));
+        Fe4 { l: h }
+    }
+
+    /// 4-bit mask of lanes whose canonical filter byte can match some pattern.
+    /// Mirror of [`super::avx512::filterbyte_accept_mask8`].
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn filterbyte_accept_mask4(
+        canon: &Fe4,
+        byte: super::FilterByte,
+        filter: &[(u8, u8)],
+    ) -> u8 {
+        let b = match byte {
+            super::FilterByte::First => {
+                _mm256_and_si256(canon.l[0], _mm256_set1_epi64x(0xFF))
+            }
+            super::FilterByte::Last => _mm256_and_si256(
+                _mm256_srli_epi64(canon.l[9], 18),
+                _mm256_set1_epi64x(0x7F),
+            ),
+        };
+        let mut accept: u8 = 0;
+        for &(mask, value) in filter {
+            let m = _mm256_and_si256(b, _mm256_set1_epi64x(mask as i64));
+            let eq = _mm256_cmpeq_epi64(m, _mm256_set1_epi64x(value as i64));
+            accept |= _mm256_movemask_pd(_mm256_castsi256_pd(eq)) as u8;
+        }
+        accept
+    }
+
+    /// Vectorized bit-packing for four lanes; mirror of
+    /// [`super::avx512::pack8_words`]. Returned as `[word][lane]`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn pack4_words(canon: &Fe4) -> [[u64; 4]; 4] {
+        let l = &canon.l;
+        let w0 = _mm256_or_si256(
+            l[0],
+            _mm256_or_si256(_mm256_slli_epi64(l[1], 26), _mm256_slli_epi64(l[2], 51)),
+        );
+        let w1 = _mm256_or_si256(
+            _mm256_srli_epi64(l[2], 13),
+            _mm256_or_si256(_mm256_slli_epi64(l[3], 13), _mm256_slli_epi64(l[4], 38)),
+        );
+        let w2 = _mm256_or_si256(
+            l[5],
+            _mm256_or_si256(_mm256_slli_epi64(l[6], 25), _mm256_slli_epi64(l[7], 51)),
+        );
+        let w3 = _mm256_or_si256(
+            _mm256_srli_epi64(l[7], 13),
+            _mm256_or_si256(_mm256_slli_epi64(l[8], 12), _mm256_slli_epi64(l[9], 38)),
+        );
+        let mut out = [[0u64; 4]; 4];
+        _mm256_storeu_si256(out[0].as_mut_ptr() as *mut _, w0);
+        _mm256_storeu_si256(out[1].as_mut_ptr() as *mut _, w1);
+        _mm256_storeu_si256(out[2].as_mut_ptr() as *mut _, w2);
+        _mm256_storeu_si256(out[3].as_mut_ptr() as *mut _, w3);
+        out
+    }
+
     /// Walk `K` steps of `+step` from `p` across all four lanes, then y-only-
     /// compress every visited point with one shared batch inversion. Returns
     /// `out[s][lane]` = the y-encoding (sign bit zero) of `p + s·step` in lane
     /// `lane`, plus the next base `p + K·step`. This is the SIMD analog of
     /// `EdwardsPoint::chain_compress_y_only`, producing `4·K` keys per call.
+    /// `filter` works exactly like in [`super::avx512::chain_y_only`].
     #[target_feature(enable = "avx2")]
     pub unsafe fn chain_y_only<const K: usize>(
         mut p: Point4,
         niels: &Niels4,
+        filter: Option<(super::FilterByte, &[(u8, u8)])>,
         out: &mut [[[u8; 32]; 4]; K],
     ) -> Point4 {
         let mut ys = [p.y; K];
@@ -667,9 +792,31 @@ pub mod avx2 {
             let zinv = mul4(&inv, &prefix[s]);
             inv = mul4(&inv, &zs[s]);
             let yz = mul4(&ys[s], &zinv);
-            let lanes = store4(&yz);
-            for lane in 0..4 {
-                out[s][lane] = super::fe_tobytes(&lanes[lane]);
+            let canon = canon4(&yz);
+            match filter {
+                Some((byte, f)) => {
+                    let accept = filterbyte_accept_mask4(&canon, byte, f);
+                    if accept != 0 {
+                        let w = pack4_words(&canon);
+                        for lane in 0..4 {
+                            if accept & (1 << lane) != 0 {
+                                out[s][lane] = super::lane_bytes(&w, lane);
+                            } else {
+                                out[s][lane][0] = 0;
+                            }
+                        }
+                    } else {
+                        for lane in 0..4 {
+                            out[s][lane][0] = 0;
+                        }
+                    }
+                }
+                None => {
+                    let w = pack4_words(&canon);
+                    for lane in 0..4 {
+                        out[s][lane] = super::lane_bytes(&w, lane);
+                    }
+                }
             }
         }
         p
@@ -1046,28 +1193,75 @@ pub mod avx512 {
         Fe8 { l: h }
     }
 
-    /// 8-bit mask of lanes whose canonical first byte can match some prefix.
-    /// `filter[i] = (mask, value)`: lane passes if `byte0 & mask == value`.
+    /// 8-bit mask of lanes whose canonical filter byte can match some pattern.
+    /// `filter[i] = (mask, value)`: lane passes if `byte & mask == value`.
+    ///
+    /// `FilterByte::First` reads byte 0 (low 8 bits of limb 0);
+    /// `FilterByte::Last` reads byte 31 sans sign bit (canonical values are
+    /// `< 2^255`, so byte 31 = bits 248..254 = limb 9 bits 18..24).
     #[target_feature(enable = "avx512f")]
-    pub unsafe fn firstbyte_accept_mask8(canon: &Fe8, filter: &[(u8, u8)]) -> u8 {
-        let b0 = _mm512_and_si512(canon.l[0], _mm512_set1_epi64(0xFF));
+    pub unsafe fn filterbyte_accept_mask8(
+        canon: &Fe8,
+        byte: super::FilterByte,
+        filter: &[(u8, u8)],
+    ) -> u8 {
+        let b = match byte {
+            super::FilterByte::First => _mm512_and_si512(canon.l[0], _mm512_set1_epi64(0xFF)),
+            super::FilterByte::Last => _mm512_and_si512(
+                _mm512_srli_epi64(canon.l[9], 18),
+                _mm512_set1_epi64(0x7F),
+            ),
+        };
         let mut accept: u8 = 0;
         for &(mask, value) in filter {
-            let m = _mm512_and_si512(b0, _mm512_set1_epi64(mask as i64));
+            let m = _mm512_and_si512(b, _mm512_set1_epi64(mask as i64));
             accept |= _mm512_cmpeq_epi64_mask(m, _mm512_set1_epi64(value as i64));
         }
         accept
     }
 
+    /// Vectorized [`super::fe_pack`]: turn canonical limbs into the four
+    /// little-endian u64 words of the byte encoding, for all 8 lanes at once.
+    /// Returned as `[word][lane]`; a lane's 32 bytes are its four words in
+    /// order. Canonical limbs are non-negative and in-range, so plain logical
+    /// shifts assemble the value exactly like the scalar bit-packing.
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn pack8_words(canon: &Fe8) -> [[u64; 8]; 4] {
+        let l = &canon.l;
+        // Limb i sits at bit offset ceil(25.5*i) of the 255-bit value.
+        let w0 = _mm512_or_si512(
+            l[0],
+            _mm512_or_si512(_mm512_slli_epi64(l[1], 26), _mm512_slli_epi64(l[2], 51)),
+        );
+        let w1 = _mm512_or_si512(
+            _mm512_srli_epi64(l[2], 13),
+            _mm512_or_si512(_mm512_slli_epi64(l[3], 13), _mm512_slli_epi64(l[4], 38)),
+        );
+        let w2 = _mm512_or_si512(
+            l[5],
+            _mm512_or_si512(_mm512_slli_epi64(l[6], 25), _mm512_slli_epi64(l[7], 51)),
+        );
+        let w3 = _mm512_or_si512(
+            _mm512_srli_epi64(l[7], 13),
+            _mm512_or_si512(_mm512_slli_epi64(l[8], 12), _mm512_slli_epi64(l[9], 38)),
+        );
+        let mut out = [[0u64; 8]; 4];
+        _mm512_storeu_si512(out[0].as_mut_ptr() as *mut _, w0);
+        _mm512_storeu_si512(out[1].as_mut_ptr() as *mut _, w1);
+        _mm512_storeu_si512(out[2].as_mut_ptr() as *mut _, w2);
+        _mm512_storeu_si512(out[3].as_mut_ptr() as *mut _, w3);
+        out
+    }
+
     /// 8-wide analog of [`super::avx2::chain_y_only`]: `8·K` keys per call.
-    /// `filter = Some(..)` runs the exact first-byte prefilter (prefix search);
-    /// `None` fully encodes every lane (e.g. suffix/run search, where a
-    /// leading-byte filter does not apply).
+    /// `filter = Some((byte, pairs))` runs the exact one-byte prefilter (byte 0
+    /// for prefix search, byte 31 for suffix search); `None` fully encodes
+    /// every lane (anywhere search, where no single-byte filter applies).
     #[target_feature(enable = "avx512f")]
     pub unsafe fn chain_y_only<const K: usize>(
         mut p: Point8,
         niels: &Niels8,
-        filter: Option<&[(u8, u8)]>,
+        filter: Option<(super::FilterByte, &[(u8, u8)])>,
         out: &mut [[[u8; 32]; 8]; K],
     ) -> Point8 {
         let mut ys = [p.y; K];
@@ -1090,28 +1284,35 @@ pub mod avx512 {
             inv = mul8(&inv, &zs[s]);
             let yz = mul8(&ys[s], &zinv);
 
-            // First-byte prefilter (prefix-exact search only): canonicalize all
-            // 8 lanes once, read byte 0 exactly, and fully encode only the lanes
-            // whose first byte can match a wanted prefix; the rest get a 0x00
-            // first byte that should_skip() drops. Exact -- no false negatives
-            // or positives. `None` (suffix/run search) fully encodes every lane.
+            // Canonicalize and bit-pack all 8 lanes at once (vectorized);
+            // scalar work below is only copying each lane's four u64 words.
+            // With a filter, only lanes whose filter byte can match a wanted
+            // pattern are fully encoded; the rest get a 0x00 first byte that
+            // should_skip() drops. Sound: never rejects a lane whose true
+            // key would match.
+            let canon = canon8(&yz);
             match filter {
-                Some(f) => {
-                    let canon = canon8(&yz);
-                    let accept = firstbyte_accept_mask8(&canon, f);
-                    let lanes = store8(&canon);
-                    for lane in 0..8 {
-                        if accept & (1 << lane) != 0 {
-                            out[s][lane] = super::fe_pack(&lanes[lane]);
-                        } else {
+                Some((byte, f)) => {
+                    let accept = filterbyte_accept_mask8(&canon, byte, f);
+                    if accept != 0 {
+                        let w = pack8_words(&canon);
+                        for lane in 0..8 {
+                            if accept & (1 << lane) != 0 {
+                                out[s][lane] = super::lane_bytes(&w, lane);
+                            } else {
+                                out[s][lane][0] = 0;
+                            }
+                        }
+                    } else {
+                        for lane in 0..8 {
                             out[s][lane][0] = 0;
                         }
                     }
                 }
                 None => {
-                    let lanes = store8(&yz);
+                    let w = pack8_words(&canon);
                     for lane in 0..8 {
-                        out[s][lane] = super::fe_tobytes(&lanes[lane]);
+                        out[s][lane] = super::lane_bytes(&w, lane);
                     }
                 }
             }
@@ -1321,7 +1522,7 @@ mod tests {
         };
 
         let mut out = [[[0u8; 32]; 4]; K];
-        unsafe { avx2::chain_y_only::<K>(p4, &niels, &mut out) };
+        unsafe { avx2::chain_y_only::<K>(p4, &niels, None, &mut out) };
 
         for lane in 0..4 {
             let mut cur = starts[lane];
@@ -1336,6 +1537,46 @@ mod tests {
                 );
                 assert_eq!(out[s][lane][31] & 0x80, 0);
                 cur += step;
+            }
+        }
+    }
+
+    /// AVX2 mirror of `simd_prefilter_canon_and_mask`: canon4, pack4_words and
+    /// filterbyte_accept_mask4 must reproduce the scalar encoding exactly.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd_prefilter_canon_and_mask_avx2() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut st = 0xabcd_ef01_2345_6789u64;
+        for _ in 0..200 {
+            let xb: [[u8; 32]; 4] = core::array::from_fn(|_| rand_fe_bytes(&mut st));
+            let xf: [Fe; 4] = core::array::from_fn(|k| fe_frombytes(&xb[k]));
+            let canon = unsafe { avx2::canon4(&avx2::load4(&xf)) };
+            let canon_lanes = unsafe { avx2::store4(&canon) };
+            for k in 0..4 {
+                assert_eq!(fe_pack(&canon_lanes[k]), fe_tobytes(&xf[k]), "canon4 lane {k}");
+            }
+            let w = unsafe { avx2::pack4_words(&canon) };
+            for k in 0..4 {
+                assert_eq!(lane_bytes(&w, k), fe_tobytes(&xf[k]), "pack4_words lane {k}");
+            }
+            let t0 = fe_tobytes(&xf[2])[0];
+            let mask = unsafe {
+                avx2::filterbyte_accept_mask4(&canon, FilterByte::First, &[(0xFFu8, t0)])
+            };
+            for k in 0..4 {
+                let expect = fe_tobytes(&xf[k])[0] == t0;
+                assert_eq!((mask >> k) & 1 == 1, expect, "avx2 mask lane {k}");
+            }
+            let t31 = fe_tobytes(&xf[1])[31] & 0x7F;
+            let mask31 = unsafe {
+                avx2::filterbyte_accept_mask4(&canon, FilterByte::Last, &[(0x7Fu8, t31)])
+            };
+            for k in 0..4 {
+                let expect = (fe_tobytes(&xf[k])[31] & 0x7F) == t31;
+                assert_eq!((mask31 >> k) & 1 == 1, expect, "avx2 mask31 lane {k}");
             }
         }
     }
@@ -1356,12 +1597,33 @@ mod tests {
             for k in 0..8 {
                 assert_eq!(fe_pack(&canon_lanes[k]), fe_tobytes(&xf[k]), "canon8 lane {k}");
             }
+            // Vectorized bit-packing must agree with the scalar fe_pack.
+            let w = unsafe { avx512::pack8_words(&canon) };
+            for k in 0..8 {
+                assert_eq!(
+                    lane_bytes(&w, k),
+                    fe_tobytes(&xf[k]),
+                    "pack8_words lane {k}"
+                );
+            }
             // Mask must accept exactly the lanes whose byte0 matches the filter.
             let target = fe_tobytes(&xf[3])[0];
-            let mask = unsafe { avx512::firstbyte_accept_mask8(&canon, &[(0xFFu8, target)]) };
+            let mask = unsafe {
+                avx512::filterbyte_accept_mask8(&canon, FilterByte::First, &[(0xFFu8, target)])
+            };
             for k in 0..8 {
                 let expect = fe_tobytes(&xf[k])[0] == target;
                 assert_eq!((mask >> k) & 1 == 1, expect, "mask lane {k}");
+            }
+            // Same for byte 31 (sign bit excluded): the Last filter must
+            // accept exactly the lanes whose trailing byte matches.
+            let t31 = fe_tobytes(&xf[5])[31] & 0x7F;
+            let mask31 = unsafe {
+                avx512::filterbyte_accept_mask8(&canon, FilterByte::Last, &[(0x7Fu8, t31)])
+            };
+            for k in 0..8 {
+                let expect = (fe_tobytes(&xf[k])[31] & 0x7F) == t31;
+                assert_eq!((mask31 >> k) & 1 == 1, expect, "mask31 lane {k}");
             }
         }
     }
@@ -1432,6 +1694,117 @@ mod tests {
                 let exp = cur.compress().to_bytes();
                 assert_eq!(out[s][lane][..31], exp[..31], "chain8 lane {lane} step {s}");
                 cur += step;
+            }
+        }
+    }
+
+    /// The filtered chain must byte-for-byte match the unfiltered chain on
+    /// accepted lanes, zero byte 0 on rejected lanes, and accept exactly the
+    /// lanes whose filter byte matches. Covers the accept-bit-to-lane wiring
+    /// for both ISA widths and both filter bytes — a bug here silently drops
+    /// real matches and only ever shows up as a hung search.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd_chain_filter_differential() {
+        use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
+        use curve25519_dalek::scalar::Scalar;
+        const K: usize = 8;
+        let step = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
+        let mut stt = 0x0f1e_2d3c_4b5a_6978u64;
+        let mut rand_start = |_| {
+            EdwardsPoint::mul_base_clamped({
+                let mut s = rand_fe_bytes(&mut stt);
+                s[0] &= 248;
+                s[31] = (s[31] & 63) | 64;
+                s
+            })
+        };
+
+        if is_x86_feature_detected!("avx512f") {
+            let niels = unsafe { avx512::niels8_from_bytes(&step.niels_bytes()) };
+            let starts: [EdwardsPoint; 8] = core::array::from_fn(&mut rand_start);
+            let xyzt: [_; 8] = core::array::from_fn(|k| starts[k].xyzt_bytes());
+            let mk = || unsafe {
+                avx512::point8_from_xyzt(
+                    &core::array::from_fn(|k| fe_frombytes(&xyzt[k][0])),
+                    &core::array::from_fn(|k| fe_frombytes(&xyzt[k][1])),
+                    &core::array::from_fn(|k| fe_frombytes(&xyzt[k][2])),
+                    &core::array::from_fn(|k| fe_frombytes(&xyzt[k][3])),
+                )
+            };
+            let mut base = [[[0u8; 32]; 8]; K];
+            unsafe { avx512::chain_y_only::<K>(mk(), &niels, None, &mut base) };
+            for (byte, pairs) in [
+                (FilterByte::First, vec![(0xFFu8, base[0][0][0])]),
+                (FilterByte::Last, vec![(0x7Fu8, base[1][3][31] & 0x7F)]),
+            ] {
+                let mut outf = [[[0u8; 32]; 8]; K];
+                unsafe {
+                    avx512::chain_y_only::<K>(mk(), &niels, Some((byte, &pairs)), &mut outf)
+                };
+                for s in 0..K {
+                    for lane in 0..8 {
+                        let b = match byte {
+                            FilterByte::First => base[s][lane][0],
+                            FilterByte::Last => base[s][lane][31] & 0x7F,
+                        };
+                        if pairs.iter().any(|&(m, v)| b & m == v) {
+                            assert_eq!(
+                                outf[s][lane], base[s][lane],
+                                "avx512 {byte:?}: accepted lane {lane} step {s} differs"
+                            );
+                        } else {
+                            assert_eq!(
+                                outf[s][lane][0], 0,
+                                "avx512 {byte:?}: rejected lane {lane} step {s} not zeroed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if is_x86_feature_detected!("avx2") {
+            let niels = unsafe { avx2::niels4_from_bytes(&step.niels_bytes()) };
+            let starts: [EdwardsPoint; 4] = core::array::from_fn(&mut rand_start);
+            let xyzt: [_; 4] = core::array::from_fn(|k| starts[k].xyzt_bytes());
+            let mk = || unsafe {
+                avx2::point4_from_xyzt(
+                    &core::array::from_fn(|k| fe_frombytes(&xyzt[k][0])),
+                    &core::array::from_fn(|k| fe_frombytes(&xyzt[k][1])),
+                    &core::array::from_fn(|k| fe_frombytes(&xyzt[k][2])),
+                    &core::array::from_fn(|k| fe_frombytes(&xyzt[k][3])),
+                )
+            };
+            let mut base = [[[0u8; 32]; 4]; K];
+            unsafe { avx2::chain_y_only::<K>(mk(), &niels, None, &mut base) };
+            for (byte, pairs) in [
+                (FilterByte::First, vec![(0xFFu8, base[0][0][0])]),
+                (FilterByte::Last, vec![(0x7Fu8, base[1][2][31] & 0x7F)]),
+            ] {
+                let mut outf = [[[0u8; 32]; 4]; K];
+                unsafe {
+                    avx2::chain_y_only::<K>(mk(), &niels, Some((byte, &pairs)), &mut outf)
+                };
+                for s in 0..K {
+                    for lane in 0..4 {
+                        let b = match byte {
+                            FilterByte::First => base[s][lane][0],
+                            FilterByte::Last => base[s][lane][31] & 0x7F,
+                        };
+                        if pairs.iter().any(|&(m, v)| b & m == v) {
+                            assert_eq!(
+                                outf[s][lane], base[s][lane],
+                                "avx2 {byte:?}: accepted lane {lane} step {s} differs"
+                            );
+                        } else {
+                            assert_eq!(
+                                outf[s][lane][0], 0,
+                                "avx2 {byte:?}: rejected lane {lane} step {s} not zeroed"
+                            );
+                        }
+                    }
+                }
             }
         }
     }

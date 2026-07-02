@@ -207,47 +207,162 @@ enum What {
 pub struct Target {
     location: Location,
     what: What,
+    /// AVX2 detected at construction; selects the vectorized per-key matchers.
+    simd: bool,
+}
+
+/// Runtime AVX2 detection for the per-key matchers, done once per Target.
+fn detect_simd() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Interleave the bits of `x` into the even bit positions of a u64
+/// (bit i of `x` moves to bit 2i). Classic Morton spread.
+#[inline]
+fn spread(x: u32) -> u64 {
+    let mut v = x as u64;
+    v = (v | (v << 16)) & 0x0000_FFFF_0000_FFFF;
+    v = (v | (v << 8)) & 0x00FF_00FF_00FF_00FF;
+    v = (v | (v << 4)) & 0x0F0F_0F0F_0F0F_0F0F;
+    v = (v | (v << 2)) & 0x3333_3333_3333_3333;
+    v = (v | (v << 1)) & 0x5555_5555_5555_5555;
+    v
+}
+
+/// Nibble-adjacency mask of a key: bit `j` (j in 0..63) = "hex char j equals
+/// hex char j+1". A run of `n` identical hex chars is exactly a run of `n-1`
+/// consecutive set bits. Portable fallback for [`adj_mask`].
+fn adj_mask_scalar(pk: &[u8; 32]) -> u64 {
+    let mut a: u32 = 0; // bit i = hi nibble of byte i == lo nibble of byte i
+    let mut b: u32 = 0; // bit i = lo nibble of byte i == hi nibble of byte i+1
+    for i in 0..32 {
+        a |= (((((pk[i] >> 4) ^ pk[i]) & 0xF) == 0) as u32) << i;
+    }
+    for i in 0..31 {
+        b |= ((((pk[i] ^ (pk[i + 1] >> 4)) & 0xF) == 0) as u32) << i;
+    }
+    // String position 2i is byte i's hi nibble: within-byte adjacency lands on
+    // even bits, cross-byte on odd bits.
+    spread(a) | (spread(b) << 1)
+}
+
+/// AVX2 [`adj_mask_scalar`]: two 32-byte compares + movemask.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn adj_mask_avx2(pk: &[u8; 32]) -> u64 {
+    use core::arch::x86_64::*;
+    let v = _mm256_loadu_si256(pk.as_ptr() as *const __m256i);
+    let nib = _mm256_set1_epi8(0x0F);
+    let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), nib);
+    let lo = _mm256_and_si256(v, nib);
+    let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, lo)) as u32;
+    // hi shifted down one byte across the full 256-bit register, so lane i
+    // holds byte i+1's hi nibble.
+    let t = _mm256_permute2x128_si256(hi, hi, 0x81);
+    let hi_next = _mm256_alignr_epi8(t, hi, 1);
+    let b = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, hi_next)) as u32) & 0x7FFF_FFFF;
+    spread(a) | (spread(b) << 1)
+}
+
+/// Position mask of a key: bit `j` = "hex char j equals `val`".
+/// Portable fallback for [`nib_match_mask`].
+fn nib_match_mask_scalar(pk: &[u8; 32], val: u8) -> u64 {
+    let mut a: u32 = 0;
+    let mut b: u32 = 0;
+    for i in 0..32 {
+        a |= (((pk[i] >> 4) == val) as u32) << i;
+        b |= (((pk[i] & 0xF) == val) as u32) << i;
+    }
+    spread(a) | (spread(b) << 1)
+}
+
+/// AVX2 [`nib_match_mask_scalar`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn nib_match_mask_avx2(pk: &[u8; 32], val: u8) -> u64 {
+    use core::arch::x86_64::*;
+    let v = _mm256_loadu_si256(pk.as_ptr() as *const __m256i);
+    let nib = _mm256_set1_epi8(0x0F);
+    let w = _mm256_set1_epi8(val as i8);
+    let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), nib);
+    let lo = _mm256_and_si256(v, nib);
+    let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, w)) as u32;
+    let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, w)) as u32;
+    spread(a) | (spread(b) << 1)
+}
+
+#[inline]
+fn adj_mask(pk: &[u8; 32], simd: bool) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if simd {
+        // SAFETY: `simd` is only true when AVX2 was detected at runtime.
+        return unsafe { adj_mask_avx2(pk) };
+    }
+    let _ = simd;
+    adj_mask_scalar(pk)
+}
+
+#[inline]
+fn nib_match_mask(pk: &[u8; 32], val: u8, simd: bool) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if simd {
+        // SAFETY: `simd` is only true when AVX2 was detected at runtime.
+        return unsafe { nib_match_mask_avx2(pk, val) };
+    }
+    let _ = simd;
+    nib_match_mask_scalar(pk, val)
+}
+
+/// True if `m` contains a run of at least `len` consecutive set bits,
+/// in O(log len) shift-AND steps.
+#[inline]
+fn has_ones_run(mut m: u64, len: u32) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let mut r = 1u32;
+    while r < len {
+        let s = (len - r).min(r);
+        m &= m >> s;
+        r += s;
+    }
+    m != 0
 }
 
 /// True if `pk` matches the exact nibble pattern at `loc`. In `candidate` mode
 /// (y-only encoding) the sign nibble is treated as a wildcard.
-fn exact_match(pk: &[u8; 32], nibs: &[u8], loc: Location, candidate: bool) -> bool {
+fn exact_match(pk: &[u8; 32], nibs: &[u8], loc: Location, candidate: bool, simd: bool) -> bool {
     let l = nibs.len();
     let eq = |pos: usize, val: u8| (candidate && pos == SIGN_NIBBLE) || nibble_at(pk, pos) == val;
     match loc {
         Location::Prefix => (0..l).all(|j| eq(j, nibs[j])),
         Location::Suffix => (0..l).all(|j| eq(64 - l + j, nibs[j])),
-        Location::Anywhere => (0..=64 - l).any(|start| (0..l).all(|j| eq(start + j, nibs[j]))),
-    }
-}
-
-/// Longest run of identical nibbles. In `candidate` mode the sign nibble acts
-/// as a wildcard that extends any run (a sound over-approximation).
-fn longest_run(pk: &[u8; 32], candidate: bool) -> u32 {
-    let mut max = 1u32;
-    let mut run = 1u32;
-    let mut prev = nibble_at(pk, 0);
-    for pos in 1..64 {
-        if candidate && pos == SIGN_NIBBLE {
-            run += 1; // wildcard: assume it continues the current run
-        } else {
-            let nb = nibble_at(pk, pos);
-            if nb == prev {
-                run += 1;
-            } else {
-                run = 1;
-                prev = nb;
+        Location::Anywhere => {
+            // Bit-parallel scan: m's bit j = "pattern[..=k] matches starting
+            // at j". Shifted ANDs pull in zeros past bit 63, so starts whose
+            // pattern would run off the key drop out automatically.
+            let wc = if candidate { 1u64 << SIGN_NIBBLE } else { 0 };
+            let mut m = nib_match_mask(pk, nibs[0], simd) | wc;
+            for (k, &nb) in nibs.iter().enumerate().skip(1) {
+                if m == 0 {
+                    return false;
+                }
+                m &= (nib_match_mask(pk, nb, simd) | wc) >> k;
             }
-        }
-        if run > max {
-            max = run;
+            m != 0
         }
     }
-    max
 }
 
 /// True if `pk` has a run of `>= n` identical nibbles at `loc`.
-fn run_match(pk: &[u8; 32], n: u32, loc: Location, candidate: bool) -> bool {
+fn run_match(pk: &[u8; 32], n: u32, loc: Location, candidate: bool, simd: bool) -> bool {
     let n = n as usize;
     let eq = |pos: usize, c: u8| (candidate && pos == SIGN_NIBBLE) || nibble_at(pk, pos) == c;
     match loc {
@@ -259,7 +374,15 @@ fn run_match(pk: &[u8; 32], n: u32, loc: Location, candidate: bool) -> bool {
             let c = nibble_at(pk, 63);
             n <= 64 && (0..n).all(|j| eq(63 - j, c))
         }
-        Location::Anywhere => longest_run(pk, candidate) >= n as u32,
+        Location::Anywhere => {
+            // A run of n chars = n-1 consecutive adjacency bits. The sign
+            // nibble wildcard sets both adjacencies touching char 62.
+            let mut adj = adj_mask(pk, simd);
+            if candidate {
+                adj |= 0b11 << (SIGN_NIBBLE - 1);
+            }
+            has_ones_run(adj, n.saturating_sub(1) as u32)
+        }
     }
 }
 
@@ -275,6 +398,7 @@ impl Target {
         Target {
             location,
             what: What::Exact(exact),
+            simd: detect_simd(),
         }
     }
 
@@ -282,6 +406,7 @@ impl Target {
         Target {
             location,
             what: What::Run(n),
+            simd: detect_simd(),
         }
     }
 
@@ -290,8 +415,10 @@ impl Target {
     #[inline]
     pub fn candidate(&self, pk: &[u8; 32]) -> bool {
         match &self.what {
-            What::Exact(ts) => ts.iter().any(|(_, nibs)| exact_match(pk, nibs, self.location, true)),
-            What::Run(n) => run_match(pk, *n, self.location, true),
+            What::Exact(ts) => ts
+                .iter()
+                .any(|(_, nibs)| exact_match(pk, nibs, self.location, true, self.simd)),
+            What::Run(n) => run_match(pk, *n, self.location, true, self.simd),
         }
     }
 
@@ -301,20 +428,33 @@ impl Target {
         match &self.what {
             What::Exact(ts) => ts
                 .iter()
-                .find(|(_, nibs)| exact_match(pk, nibs, self.location, false))
+                .find(|(_, nibs)| exact_match(pk, nibs, self.location, false, self.simd))
                 .map(|(l, _)| l.clone()),
             What::Run(n) => {
-                run_match(pk, *n, self.location, false).then(|| format!("{}+ identical", n))
+                run_match(pk, *n, self.location, false, self.simd).then(|| format!("{}+ identical", n))
             }
         }
     }
 
-    /// First-byte prefilter data for the AVX-512 fast path. Only prefix-exact
-    /// search has a usable leading-byte constraint.
+    /// One-byte prefilter data for the AVX-512 fast path: which encoded byte
+    /// to test and the accepted `(mask, value)` pairs. Sound (never rejects a
+    /// real match); lanes that fail skip the full byte encoding entirely.
+    ///
+    /// - Prefix-exact: byte 0 must match the leading pattern nibbles.
+    /// - Prefix-run (n >= 2): the first two nibbles are equal, so byte 0 is
+    ///   `0xCC` for some run char C. 00/FF keys are skipped by MeshCore, so
+    ///   those two values are excluded outright.
+    /// - Suffix-exact: byte 31 must match the trailing nibbles — minus the
+    ///   sign bit, which the y-only encoding zeroes (mask 0x7F).
+    /// - Suffix-run (n >= 2): the last two nibbles are equal: byte 31 is
+    ///   `((C & 7) << 4) | C` in the sign-less encoding.
+    /// - Anywhere: no single-byte constraint exists; `None`.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    pub fn first_byte_filter(&self) -> Option<Vec<(u8, u8)>> {
+    pub fn kernel_filter(&self) -> Option<(crate::simd4::FilterByte, Vec<(u8, u8)>)> {
+        use crate::simd4::FilterByte;
         match (self.location, &self.what) {
-            (Location::Prefix, What::Exact(ts)) => Some(
+            (Location::Prefix, What::Exact(ts)) => Some((
+                FilterByte::First,
                 ts.iter()
                     .map(|(_, nibs)| {
                         if nibs.len() >= 2 {
@@ -324,7 +464,28 @@ impl Target {
                         }
                     })
                     .collect(),
-            ),
+            )),
+            (Location::Prefix, What::Run(n)) if *n >= 2 => Some((
+                FilterByte::First,
+                (1..=14).map(|c| (0xFF, c * 0x11)).collect(),
+            )),
+            (Location::Suffix, What::Exact(ts)) => Some((
+                FilterByte::Last,
+                ts.iter()
+                    .map(|(_, nibs)| {
+                        let l = nibs.len();
+                        if l >= 2 {
+                            (0x7F, ((nibs[l - 2] & 7) << 4) | nibs[l - 1])
+                        } else {
+                            (0x0F, nibs[l - 1])
+                        }
+                    })
+                    .collect(),
+            )),
+            (Location::Suffix, What::Run(n)) if *n >= 2 => Some((
+                FilterByte::Last,
+                (0..=15).map(|c| (0x7F, ((c & 7) << 4) | c)).collect(),
+            )),
             _ => None,
         }
     }
@@ -563,14 +724,14 @@ impl SearchHandle {
 }
 
 /// Per worker: number of chained points compressed under one batched
-/// inversion. The single field inversion in `compress_batch` (~265 field
-/// muls via the pow22523 chain) is the dominant cost, so amortizing it over
-/// more points is the biggest CPU lever: raising this from 16 to 256
-/// measured ~1.57x throughput on a 4-core Xeon. Returns diminish past 256
-/// (the per-point `+8B` add becomes the floor) while stack/cache footprint
-/// keeps growing — the batch holds `CHAIN_BATCH` EdwardsPoints (~160 B each)
-/// plus scratch — so 256 sits at the knee of the curve.
-const CHAIN_BATCH: usize = 512;
+/// inversion. The single field inversion (~265 field muls via the pow22523
+/// chain) is a fixed per-batch cost, so amortizing it over more points is a
+/// big CPU lever. With the fully vectorized canon+pack path the per-point
+/// floor dropped enough that 1024 measures ~10% faster than 512 on a 4-core
+/// Xeon; 2048 is flat-to-negative while doubling the working set (the SIMD
+/// workers hold 3 Fe8 arrays of K = CHAIN_BATCH/8 entries, ~240 KB at 1024),
+/// so 1024 sits at the knee of the curve.
+const CHAIN_BATCH: usize = 1024;
 
 /// Spawn one CPU worker thread that scans via a `+8B` chain with
 /// Montgomery batched compression.
@@ -722,11 +883,16 @@ unsafe fn cpu_worker_simd(
         &core::array::from_fn(|l| fe_frombytes(&xyzt[l][3])),
     );
 
+    // Prefix and suffix searches supply a one-byte filter (prefilter fast
+    // path); anywhere searches fully encode every lane.
+    let filter = target.kernel_filter();
+
     let mut out: Box<[[[u8; 32]; 4]; K]> = Box::new([[[0u8; 32]; 4]; K]);
     let mut local_count: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        p4 = avx2::chain_y_only::<K>(p4, &niels, &mut out);
+        let f = filter.as_ref().map(|(b, v)| (*b, v.as_slice()));
+        p4 = avx2::chain_y_only::<K>(p4, &niels, f, &mut out);
 
         for s in 0..K {
             for lane in 0..4 {
@@ -802,15 +968,16 @@ unsafe fn cpu_worker_simd512(
         &core::array::from_fn(|l| fe_frombytes(&xyzt[l][3])),
     );
 
-    // Prefix-exact search supplies a first-byte filter (prefilter fast path);
-    // other modes fully encode every lane.
-    let filter = target.first_byte_filter();
+    // Prefix and suffix searches supply a one-byte filter (prefilter fast
+    // path); anywhere searches fully encode every lane.
+    let filter = target.kernel_filter();
 
     let mut out: Box<[[[u8; 32]; 8]; K]> = Box::new([[[0u8; 32]; 8]; K]);
     let mut local_count: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        p8 = avx512::chain_y_only::<K>(p8, &niels, filter.as_deref(), &mut out);
+        let f = filter.as_ref().map(|(b, v)| (*b, v.as_slice()));
+        p8 = avx512::chain_y_only::<K>(p8, &niels, f, &mut out);
 
         for s in 0..K {
             for lane in 0..8 {
@@ -1043,6 +1210,277 @@ mod tests {
         }
     }
 
+    /// Soundness property of every kernel prefilter table: a key that
+    /// authoritatively matches (with either sign-bit value) must have its
+    /// y-only filter byte accepted. A violation means the kernel silently
+    /// drops real matches — the search never terminates. This is the test
+    /// that catches wrong (mask, value) table entries (e.g. transposed
+    /// nibbles or a missing run char) which end-to-end searches mask by
+    /// simply finding a different key.
+    #[test]
+    fn kernel_filter_soundness() {
+        use crate::simd4::FilterByte;
+        fn filter_byte(true_key: &[u8; 32], byte: FilterByte) -> u8 {
+            match byte {
+                FilterByte::First => true_key[0],
+                // The kernel tests the y-only encoding: sign bit zeroed.
+                FilterByte::Last => true_key[31] & 0x7F,
+            }
+        }
+        fn accepts(pairs: &[(u8, u8)], b: u8) -> bool {
+            pairs.iter().any(|&(m, v)| b & m == v)
+        }
+        fn plant(key: &mut [u8; 32], pos: usize, nib: u8) {
+            let by = &mut key[pos / 2];
+            if pos % 2 == 0 {
+                *by = (*by & 0x0F) | (nib << 4);
+            } else {
+                *by = (*by & 0xF0) | nib;
+            }
+        }
+        let mut st = 0x5555_aaaa_1234_5678u64;
+        let mut rnd = || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (st >> 33) as u8
+        };
+
+        // Exact patterns, lengths 1..=5, planted at prefix and suffix.
+        for len in 1..=5usize {
+            for _ in 0..50 {
+                let nibs: Vec<u8> = (0..len).map(|_| rnd() % 16).collect();
+                let pat: String = nibs.iter().map(|n| format!("{:X}", n)).collect();
+                for (loc, at) in [(Location::Prefix, 0usize), (Location::Suffix, 64 - len)] {
+                    let t = Target::exact(loc, &[pat.clone()]);
+                    let Some((byte, pairs)) = t.kernel_filter() else {
+                        continue;
+                    };
+                    for sign in [0u8, 0x80] {
+                        let mut key = [0u8; 32];
+                        for b in key.iter_mut() {
+                            *b = rnd();
+                        }
+                        for (j, &nb) in nibs.iter().enumerate() {
+                            plant(&mut key, at + j, nb);
+                        }
+                        key[31] = (key[31] & 0x7F) | sign;
+                        // Forcing the sign bit may break the planted pattern
+                        // at char 62; then the key is genuinely not a match.
+                        if t.authoritative(&key).is_none() {
+                            continue;
+                        }
+                        assert!(
+                            accepts(&pairs, filter_byte(&key, byte)),
+                            "filter rejected a real {loc:?} exact match: pat={pat} sign={sign:02X} key={}",
+                            hex::encode_upper(key),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Run targets: every run char, n in 2..=5, at prefix and suffix.
+        for n in 2..=5u32 {
+            for c in 0u8..=15 {
+                for loc in [Location::Prefix, Location::Suffix] {
+                    let t = Target::run(loc, n);
+                    let Some((byte, pairs)) = t.kernel_filter() else {
+                        continue;
+                    };
+                    for sign in [0u8, 0x80] {
+                        let mut key = [0u8; 32];
+                        for b in key.iter_mut() {
+                            *b = rnd();
+                        }
+                        let range = match loc {
+                            Location::Prefix => 0..n as usize,
+                            _ => (64 - n as usize)..64,
+                        };
+                        for pos in range {
+                            plant(&mut key, pos, c);
+                        }
+                        key[31] = (key[31] & 0x7F) | sign;
+                        if t.authoritative(&key).is_none() {
+                            continue;
+                        }
+                        // Keys starting 00/FF are dropped by should_skip
+                        // before the filter result matters.
+                        if should_skip(&key) {
+                            continue;
+                        }
+                        assert!(
+                            accepts(&pairs, filter_byte(&key, byte)),
+                            "filter rejected a real {loc:?} run: n={n} c={c:X} sign={sign:02X} key={}",
+                            hex::encode_upper(key),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The sign-nibble wildcard in the anywhere matchers is load-bearing:
+    /// a true key whose qualifying run/pattern crosses char 62 changes there
+    /// when the sign bit is zeroed, and candidate() must still accept the
+    /// y-only encoding. Directed keys, both matcher backends.
+    #[test]
+    fn candidate_wildcard_at_sign_nibble() {
+        let mut st = 0x1122_3344_5566_7788u64;
+        let mut rnd = || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (st >> 33) as u8
+        };
+        for _ in 0..100 {
+            // Run chars with the high bit set: zeroing the sign bit changes
+            // char 62 from c to c-8, so only the wildcard keeps the match.
+            for c in 8u8..=15 {
+                let mut key = [0u8; 32];
+                for b in key.iter_mut() {
+                    *b = rnd();
+                }
+                // Run of 5 at chars 59..=63 (byte29 lo, bytes 30-31 full).
+                key[29] = (key[29] & 0xF0) | c;
+                key[30] = (c << 4) | c;
+                key[31] = (c << 4) | c;
+                let mut yonly = key;
+                yonly[31] &= 0x7F;
+                for n in 2..=5u32 {
+                    for simd in [false, true] {
+                        if simd && !detect_simd() {
+                            continue;
+                        }
+                        let mut t = Target::run(Location::Anywhere, n);
+                        t.simd = simd;
+                        if t.authoritative(&key).is_some() {
+                            assert!(
+                                t.candidate(&yonly),
+                                "candidate missed anywhere-run n={n} c={c:X} simd={simd} key={}",
+                                hex::encode_upper(key),
+                            );
+                        }
+                    }
+                }
+                // Exact anywhere: patterns of length 1..=3 read from the true
+                // key at starts covering char 62.
+                for len in 1..=3usize {
+                    for start in (62usize.saturating_sub(len - 1))..=(64 - len) {
+                        let nibs: Vec<u8> =
+                            (start..start + len).map(|p| nibble_at(&key, p)).collect();
+                        let pat: String = nibs.iter().map(|n| format!("{:X}", n)).collect();
+                        for simd in [false, true] {
+                            if simd && !detect_simd() {
+                                continue;
+                            }
+                            let mut t = Target::exact(Location::Anywhere, &[pat.clone()]);
+                            t.simd = simd;
+                            assert!(t.authoritative(&key).is_some());
+                            assert!(
+                                t.candidate(&yonly),
+                                "candidate missed anywhere-exact pat={pat} start={start} simd={simd} key={}",
+                                hex::encode_upper(key),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The bit-parallel anywhere matchers must agree with a plain reference
+    /// scan on random keys, for both the SIMD and scalar mask builders.
+    #[test]
+    fn swar_matchers_match_reference() {
+        fn ref_longest_run(pk: &[u8; 32]) -> u32 {
+            let mut max = 1u32;
+            let mut run = 1u32;
+            for pos in 1..64 {
+                if nibble_at(pk, pos) == nibble_at(pk, pos - 1) {
+                    run += 1;
+                } else {
+                    run = 1;
+                }
+                max = max.max(run);
+            }
+            max
+        }
+        fn ref_exact_anywhere(pk: &[u8; 32], nibs: &[u8], candidate: bool) -> bool {
+            let l = nibs.len();
+            let eq = |pos: usize, val: u8| {
+                (candidate && pos == SIGN_NIBBLE) || nibble_at(pk, pos) == val
+            };
+            (0..=64 - l).any(|s| (0..l).all(|j| eq(s + j, nibs[j])))
+        }
+
+        let mut st = 0x0123_4567_89ab_cdefu64;
+        let mut rnd = || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (st >> 33) as u8
+        };
+        for iter in 0..4000 {
+            let mut pk = [0u8; 32];
+            for b in pk.iter_mut() {
+                *b = rnd();
+            }
+            // Plant a run sometimes so long runs are exercised, not just the
+            // random-tail distribution.
+            if iter % 3 == 0 {
+                let start = (rnd() % 28) as usize;
+                let len = 2 + (rnd() % 12) as usize;
+                let c = rnd() % 16;
+                for j in start..(start + len).min(64) {
+                    let byte = &mut pk[j / 2];
+                    if j % 2 == 0 {
+                        *byte = (*byte & 0x0F) | (c << 4);
+                    } else {
+                        *byte = (*byte & 0xF0) | c;
+                    }
+                }
+            }
+
+            for simd in [false, true] {
+                if simd && !detect_simd() {
+                    continue;
+                }
+                // Exact run matching (authoritative mode) vs reference.
+                let lr = ref_longest_run(&pk);
+                for n in 1..=16u32 {
+                    assert_eq!(
+                        run_match(&pk, n, Location::Anywhere, false, simd),
+                        lr >= n,
+                        "run n={n} simd={simd} pk={}",
+                        hex::encode_upper(pk),
+                    );
+                }
+                // Candidate mode must accept at least everything the exact
+                // mode accepts (sound over-approximation).
+                for n in 1..=16u32 {
+                    if lr >= n {
+                        assert!(run_match(&pk, n, Location::Anywhere, true, simd));
+                    }
+                }
+                // Exact anywhere pattern matching, both modes, patterns taken
+                // from the key (guaranteed hits) and random (mostly misses).
+                for &(start, len) in &[(0usize, 3usize), (13, 5), (59, 5), (30, 8)] {
+                    let nibs: Vec<u8> = (start..start + len).map(|p| nibble_at(&pk, p)).collect();
+                    for cand in [false, true] {
+                        assert_eq!(
+                            exact_match(&pk, &nibs, Location::Anywhere, cand, simd),
+                            ref_exact_anywhere(&pk, &nibs, cand),
+                            "planted pattern start={start} len={len} cand={cand} simd={simd}",
+                        );
+                    }
+                }
+                let rand_nibs: Vec<u8> = (0..4).map(|_| rnd() % 16).collect();
+                for cand in [false, true] {
+                    assert_eq!(
+                        exact_match(&pk, &rand_nibs, Location::Anywhere, cand, simd),
+                        ref_exact_anywhere(&pk, &rand_nibs, cand),
+                        "random pattern cand={cand} simd={simd}",
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn prefix_matcher_full_bytes() {
         let m = PrefixMatcher::new("AB");
@@ -1174,6 +1612,67 @@ mod tests {
             hex::encode_upper(scalar),
             result.public_key
         );
+    }
+
+    /// End-to-end soundness for every search mode: run a real multi-threaded
+    /// search with an easy target, then check both that the key satisfies the
+    /// target and that the returned scalar reproduces the public key.
+    #[test]
+    fn search_all_modes_end_to_end() {
+        let targets: Vec<(Target, Box<dyn Fn(&str) -> bool>)> = vec![
+            (
+                Target::exact(Location::Suffix, &["7".to_string()]),
+                Box::new(|pk: &str| pk.ends_with('7')),
+            ),
+            // Two differing chars: exercises the two-nibble suffix kernel
+            // filter arm (a transposed-nibble table would hang this search).
+            (
+                Target::exact(Location::Suffix, &["AB".to_string()]),
+                Box::new(|pk: &str| pk.ends_with("AB")),
+            ),
+            (
+                Target::exact(Location::Anywhere, &["ABC".to_string()]),
+                Box::new(|pk: &str| pk.contains("ABC")),
+            ),
+            (
+                Target::run(Location::Prefix, 2),
+                Box::new(|pk: &str| {
+                    let b = pk.as_bytes();
+                    b[0] == b[1]
+                }),
+            ),
+            (
+                Target::run(Location::Suffix, 2),
+                Box::new(|pk: &str| {
+                    let b = pk.as_bytes();
+                    b[62] == b[63]
+                }),
+            ),
+            (
+                Target::run(Location::Anywhere, 4),
+                Box::new(|pk: &str| {
+                    pk.as_bytes().windows(4).any(|w| w.iter().all(|&c| c == w[0]))
+                }),
+            ),
+        ];
+        for (target, check) in targets {
+            let handle = SearchHandle::start(Arc::new(target), 2);
+            let result = handle.finish().expect("search should find a match");
+            assert!(
+                check(&result.public_key),
+                "key {} does not satisfy its target",
+                result.public_key
+            );
+            let priv_bytes = hex::decode(&result.private_key).unwrap();
+            let mut scalar = [0u8; 32];
+            scalar.copy_from_slice(&priv_bytes[..32]);
+            let derived = EdwardsPoint::mul_base_clamped(scalar).compress().to_bytes();
+            assert_eq!(
+                hex::encode_upper(derived),
+                result.public_key,
+                "scalar does not reproduce pubkey"
+            );
+        }
     }
 
     /// The hot loop scans `compress_batch_y_only` (sign bit zeroed) but the

@@ -27,7 +27,7 @@ const SCHEMA_VERSION: u32 = 2;
 /// Number of points compressed under one batched inversion. Mirrors
 /// `CHAIN_BATCH` in src/search.rs so the bench worker measures the same hot
 /// loop the real search uses.
-const CHAIN_BATCH: usize = 512;
+const CHAIN_BATCH: usize = 1024;
 
 /// Per-worker flush threshold for atomic counter updates. Keeping it batched
 /// avoids dominating the loop with cache-line contention at >1 MH/s.
@@ -321,12 +321,15 @@ unsafe fn bench_worker_simd(
         &core::array::from_fn(|l| fe_frombytes(&xyzt[l][3])),
     );
 
+    let filter = target.kernel_filter();
+
     let mut out: Box<[[[u8; 32]; 4]; K]> = Box::new([[[0u8; 32]; 4]; K]);
     let mut local_keys: u64 = 0;
     let mut local_matches: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        p4 = avx2::chain_y_only::<K>(p4, &niels, &mut out);
+        let f = filter.as_ref().map(|(b, v)| (*b, v.as_slice()));
+        p4 = avx2::chain_y_only::<K>(p4, &niels, f, &mut out);
 
         for s in 0..K {
             for lane in 0..4 {
@@ -387,14 +390,15 @@ unsafe fn bench_worker_simd512(
         &core::array::from_fn(|l| fe_frombytes(&xyzt[l][3])),
     );
 
-    let filter = target.first_byte_filter();
+    let filter = target.kernel_filter();
 
     let mut out: Box<[[[u8; 32]; 8]; K]> = Box::new([[[0u8; 32]; 8]; K]);
     let mut local_keys: u64 = 0;
     let mut local_matches: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        p8 = avx512::chain_y_only::<K>(p8, &niels, filter.as_deref(), &mut out);
+        let f = filter.as_ref().map(|(b, v)| (*b, v.as_slice()));
+        p8 = avx512::chain_y_only::<K>(p8, &niels, f, &mut out);
 
         for s in 0..K {
             for lane in 0..8 {
