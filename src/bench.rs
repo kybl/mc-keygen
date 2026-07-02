@@ -305,7 +305,7 @@ unsafe fn bench_worker_simd(
 
 
     let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
-    let niels = avx2::niels4_from_bytes(&eight_b.niels_bytes());
+    let niels = avx2::niels4_from_bytes(&eight_b.niels_affine_bytes());
 
     let mut scalars = [[0u8; 32]; 4];
     for l in 0..4 {
@@ -374,7 +374,7 @@ unsafe fn bench_worker_simd512(
     const K: usize = CHAIN_BATCH / 8;
 
     let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
-    let niels = avx512::niels8_from_bytes(&eight_b.niels_bytes());
+    let niels = avx512::niels8_from_bytes(&eight_b.niels_affine_bytes());
 
     let mut scalars = [[0u8; 32]; 8];
     for l in 0..8 {

@@ -881,7 +881,7 @@ unsafe fn cpu_worker_simd(
     let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
     // Each batch advances every lane by K steps of 8B.
     let big_step = ED25519_BASEPOINT_TABLE * &Scalar::from((8 * K) as u64);
-    let niels = avx2::niels4_from_bytes(&eight_b.niels_bytes());
+    let niels = avx2::niels4_from_bytes(&eight_b.niels_affine_bytes());
 
     // Four independent random starting keys, one per lane.
     let mut scalars = [[0u8; 32]; 4];
@@ -967,7 +967,7 @@ unsafe fn cpu_worker_simd512(
 
     let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
     let big_step = ED25519_BASEPOINT_TABLE * &Scalar::from((8 * K) as u64);
-    let niels = avx512::niels8_from_bytes(&eight_b.niels_bytes());
+    let niels = avx512::niels8_from_bytes(&eight_b.niels_affine_bytes());
 
     let mut scalars = [[0u8; 32]; 8];
     for l in 0..8 {

@@ -2,8 +2,16 @@
 
 Vendored and wired in via `[patch.crates-io]` in the repo root `Cargo.toml`.
 
-The **only** local change is two added public methods on `EdwardsPoint`
-(`src/edwards.rs`), used by the CPU vanity-search hot loop in `src/search.rs`:
+The **only** local change is a handful of added public methods on
+`EdwardsPoint` (`src/edwards.rs`), used by the CPU vanity-search hot loop in
+`src/search.rs` and the SIMD chain in `src/simd4.rs`:
+
+- `niels_bytes(&self) -> [[u8; 32]; 4]` / `niels_affine_bytes(&self) -> [[u8; 32]; 3]`
+  The fixed `+step` addend as projective-niels `(Y+X, Y-X, Z, T·2d)` or
+  affine-niels `(y+x, y-x, x·y·2d)` bytes, for seeding a SIMD chain. The SIMD
+  workers use the affine form so each step is a 7-mul mixed addition instead
+  of 8 (the `2·Z1·Z2` term reduces to `2·Z1` when the addend's `Z = 1`).
+
 
 - `compress_batch_y_only<const N>(&[EdwardsPoint; N]) -> [[u8; 32]; N]`
   Like `compress_batch`, but encodes only the y-coordinate and leaves the sign

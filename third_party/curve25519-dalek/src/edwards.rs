@@ -711,6 +711,21 @@ impl EdwardsPoint {
         ]
     }
 
+    /// Test/seed hook: this point's *affine*-niels coordinates
+    /// (y+x, y-x, x·y·2d) as canonical bytes, i.e. the projective-niels form
+    /// normalized to Z = 1. A SIMD chain using this as a fixed `+step` addend
+    /// can drop one field multiply per step (mixed vs. projective addition).
+    /// Not part of the stable public API.
+    #[doc(hidden)]
+    pub fn niels_affine_bytes(&self) -> [[u8; 32]; 3] {
+        let n = self.as_affine_niels();
+        [
+            n.y_plus_x.to_bytes(),
+            n.y_minus_x.to_bytes(),
+            n.xy2d.to_bytes(),
+        ]
+    }
+
     /// Compress several `EdwardsPoint`s into `CompressedEdwardsY` format, using a batch inversion
     /// for a significant speedup.
     #[cfg(feature = "alloc")]

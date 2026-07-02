@@ -582,19 +582,20 @@ pub mod avx2 {
         pub t: Fe4,
     }
 
-    /// A fixed `+step` addend in projective-niels form (same for all lanes).
+    /// A fixed `+step` addend in *affine*-niels form (Z = 1, same for all
+    /// lanes): `yp = y+x`, `ym = y-x`, `t2d = x·y·2d`.
     #[derive(Clone, Copy)]
     pub struct Niels4 {
         pub yp: Fe4,
         pub ym: Fe4,
-        pub z: Fe4,
         pub t2d: Fe4,
     }
 
     /// `p + niels` via the dalek mixed-add formula (p3 + niels -> p1p1 -> p3).
     /// Mirrors ref10/dalek exactly; the balanced (rounded) carry in `mul4`
     /// keeps every intermediate within the `19*g < 2^31` tolerance, so no
-    /// extra reduction is needed.
+    /// extra reduction is needed. With an affine addend (Z = 1) the `2·Z1·Z2`
+    /// term is just `2·Z1`, so the step costs 7 field muls instead of 8.
     #[target_feature(enable = "avx2")]
     pub unsafe fn madd4(p: &Point4, n: &Niels4) -> Point4 {
         let yp_x = add4(&p.y, &p.x);
@@ -602,8 +603,7 @@ pub mod avx2 {
         let pp = mul4(&yp_x, &n.yp);
         let mm = mul4(&ym_x, &n.ym);
         let tt2d = mul4(&p.t, &n.t2d);
-        let zz = mul4(&p.z, &n.z);
-        let zz2 = add4(&zz, &zz);
+        let zz2 = add4(&p.z, &p.z);
         // completed point
         let cx = sub4(&pp, &mm);
         let cy = add4(&pp, &mm);
@@ -687,14 +687,13 @@ pub mod avx2 {
     }
 
     /// Build the shared `+step` niels addend (broadcast to all lanes) from its
-    /// canonical bytes `(Y+X, Y-X, Z, T·2d)`.
+    /// canonical affine-niels bytes `(y+x, y-x, x·y·2d)`.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn niels4_from_bytes(nb: &[[u8; 32]; 4]) -> Niels4 {
+    pub unsafe fn niels4_from_bytes(nb: &[[u8; 32]; 3]) -> Niels4 {
         Niels4 {
             yp: broadcast(&super::fe_frombytes(&nb[0])),
             ym: broadcast(&super::fe_frombytes(&nb[1])),
-            z: broadcast(&super::fe_frombytes(&nb[2])),
-            t2d: broadcast(&super::fe_frombytes(&nb[3])),
+            t2d: broadcast(&super::fe_frombytes(&nb[2])),
         }
     }
 
@@ -1155,14 +1154,18 @@ pub mod avx512 {
         pub t: Fe8,
     }
 
+    /// A fixed `+step` addend in affine-niels form (Z = 1): `yp = y+x`,
+    /// `ym = y-x`, `t2d = x·y·2d`.
     #[derive(Clone, Copy)]
     pub struct Niels8 {
         pub yp: Fe8,
         pub ym: Fe8,
-        pub z: Fe8,
         pub t2d: Fe8,
     }
 
+    /// Mixed addition `p + niels` (affine addend, Z = 1): the `2·Z1·Z2` term
+    /// reduces to `2·Z1`, so this is 7 field muls instead of the 8 a
+    /// projective-niels addend would take.
     #[target_feature(enable = "avx512f")]
     pub unsafe fn madd8(p: &Point8, n: &Niels8) -> Point8 {
         let yp_x = add8(&p.y, &p.x);
@@ -1170,8 +1173,7 @@ pub mod avx512 {
         let pp = mul8(&yp_x, &n.yp);
         let mm = mul8(&ym_x, &n.ym);
         let tt2d = mul8(&p.t, &n.t2d);
-        let zz = mul8(&p.z, &n.z);
-        let zz2 = add8(&zz, &zz);
+        let zz2 = add8(&p.z, &p.z);
         let cx = sub8(&pp, &mm);
         let cy = add8(&pp, &mm);
         let cz = add8(&zz2, &tt2d);
@@ -1251,12 +1253,11 @@ pub mod avx512 {
     }
 
     #[target_feature(enable = "avx512f")]
-    pub unsafe fn niels8_from_bytes(nb: &[[u8; 32]; 4]) -> Niels8 {
+    pub unsafe fn niels8_from_bytes(nb: &[[u8; 32]; 3]) -> Niels8 {
         Niels8 {
             yp: broadcast(&super::fe_frombytes(&nb[0])),
             ym: broadcast(&super::fe_frombytes(&nb[1])),
-            z: broadcast(&super::fe_frombytes(&nb[2])),
-            t2d: broadcast(&super::fe_frombytes(&nb[3])),
+            t2d: broadcast(&super::fe_frombytes(&nb[2])),
         }
     }
 
@@ -1624,15 +1625,7 @@ mod tests {
             return;
         }
         let step = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
-        let nb = step.niels_bytes();
-        let niels = unsafe {
-            avx2::Niels4 {
-                yp: avx2::broadcast(&fe_frombytes(&nb[0])),
-                ym: avx2::broadcast(&fe_frombytes(&nb[1])),
-                z: avx2::broadcast(&fe_frombytes(&nb[2])),
-                t2d: avx2::broadcast(&fe_frombytes(&nb[3])),
-            }
-        };
+        let niels = unsafe { avx2::niels4_from_bytes(&step.niels_affine_bytes()) };
 
         let mut st = 0x5151_2323_9797_0001u64;
         for _ in 0..200 {
@@ -1692,7 +1685,7 @@ mod tests {
         }
         const K: usize = 8;
         let step = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
-        let niels = unsafe { avx2::niels4_from_bytes(&step.niels_bytes()) };
+        let niels = unsafe { avx2::niels4_from_bytes(&step.niels_affine_bytes()) };
 
         let mut st = 0x7777_3333_dddd_0001u64;
         let starts: [_; 4] = core::array::from_fn(|_| {
@@ -1857,7 +1850,7 @@ mod tests {
         }
         const K: usize = 8;
         let step = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
-        let niels = unsafe { avx512::niels8_from_bytes(&step.niels_bytes()) };
+        let niels = unsafe { avx512::niels8_from_bytes(&step.niels_affine_bytes()) };
         let mut stt = 0x1357_9bdf_0246_8aceu64;
         let starts: [_; 8] = core::array::from_fn(|_| {
             EdwardsPoint::mul_base_clamped({
@@ -2001,7 +1994,7 @@ mod tests {
         };
 
         if avx512_ok() {
-            let niels = unsafe { avx512::niels8_from_bytes(&step.niels_bytes()) };
+            let niels = unsafe { avx512::niels8_from_bytes(&step.niels_affine_bytes()) };
             let starts: [EdwardsPoint; 8] = core::array::from_fn(&mut rand_start);
             let xyzt: [_; 8] = core::array::from_fn(|k| starts[k].xyzt_bytes());
             let mk = || unsafe {
@@ -2072,7 +2065,7 @@ mod tests {
         }
 
         if is_x86_feature_detected!("avx2") {
-            let niels = unsafe { avx2::niels4_from_bytes(&step.niels_bytes()) };
+            let niels = unsafe { avx2::niels4_from_bytes(&step.niels_affine_bytes()) };
             let starts: [EdwardsPoint; 4] = core::array::from_fn(&mut rand_start);
             let xyzt: [_; 4] = core::array::from_fn(|k| starts[k].xyzt_bytes());
             let mk = || unsafe {
