@@ -227,8 +227,8 @@ fn spawn_cpu_bench_worker(
     thread::spawn(move || {
         #[cfg(target_arch = "x86_64")]
         {
-            if CHAIN_BATCH % 8 == 0 && std::is_x86_feature_detected!("avx512f") {
-                // SAFETY: guarded by the runtime avx512f check.
+            if CHAIN_BATCH % 8 == 0 && crate::simd4::avx512_ok() {
+                // SAFETY: guarded by the runtime avx512f+bw check.
                 unsafe { bench_worker_simd512(&matchers, &stop, &keys, &matches) };
                 return;
             }
@@ -328,7 +328,7 @@ unsafe fn bench_worker_simd(
     let mut local_matches: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        let f = filter.as_ref().map(|(b, v)| (*b, v.as_slice()));
+        let f = filter.as_ref();
         p4 = avx2::chain_y_only::<K>(p4, &niels, f, &mut out);
 
         for s in 0..K {
@@ -361,7 +361,7 @@ unsafe fn bench_worker_simd(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn bench_worker_simd512(
     target: &Target,
     stop: &AtomicBool,
@@ -397,7 +397,7 @@ unsafe fn bench_worker_simd512(
     let mut local_matches: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        let f = filter.as_ref().map(|(b, v)| (*b, v.as_slice()));
+        let f = filter.as_ref();
         p8 = avx512::chain_y_only::<K>(p8, &niels, f, &mut out);
 
         for s in 0..K {

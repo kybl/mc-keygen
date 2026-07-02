@@ -436,9 +436,8 @@ impl Target {
         }
     }
 
-    /// One-byte prefilter data for the AVX-512 fast path: which encoded byte
-    /// to test and the accepted `(mask, value)` pairs. Sound (never rejects a
-    /// real match); lanes that fail skip the full byte encoding entirely.
+    /// Kernel prefilter for the SIMD fast paths. Sound (never rejects a real
+    /// match); lanes that fail skip the full byte encoding entirely.
     ///
     /// - Prefix-exact: byte 0 must match the leading pattern nibbles.
     /// - Prefix-run (n >= 2): the first two nibbles are equal, so byte 0 is
@@ -448,12 +447,19 @@ impl Target {
     ///   sign bit, which the y-only encoding zeroes (mask 0x7F).
     /// - Suffix-run (n >= 2): the last two nibbles are equal: byte 31 is
     ///   `((C & 7) << 4) | C` in the sign-less encoding.
-    /// - Anywhere: no single-byte constraint exists; `None`.
+    /// - Anywhere-run (n >= 5): a run of n nibbles always contains
+    ///   `floor((n-1)/2)` consecutive equal double-nibble bytes; the kernel
+    ///   checks that byte-level condition (capped at 3 bytes, byte 31
+    ///   wildcarded). Below n = 7 the byte 31 wildcard makes the condition
+    ///   too leaky to pay for itself (measured slower), so no filter —
+    ///   which costs nothing, since short-run searches finish in well under
+    ///   a second anyway.
+    /// - Anywhere-exact: no cheap kernel constraint exists; `None`.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    pub fn kernel_filter(&self) -> Option<(crate::simd4::FilterByte, Vec<(u8, u8)>)> {
-        use crate::simd4::FilterByte;
+    pub fn kernel_filter(&self) -> Option<crate::simd4::KernelFilter> {
+        use crate::simd4::{FilterByte, KernelFilter};
         match (self.location, &self.what) {
-            (Location::Prefix, What::Exact(ts)) => Some((
+            (Location::Prefix, What::Exact(ts)) => Some(KernelFilter::Byte(
                 FilterByte::First,
                 ts.iter()
                     .map(|(_, nibs)| {
@@ -465,11 +471,11 @@ impl Target {
                     })
                     .collect(),
             )),
-            (Location::Prefix, What::Run(n)) if *n >= 2 => Some((
+            (Location::Prefix, What::Run(n)) if *n >= 2 => Some(KernelFilter::Byte(
                 FilterByte::First,
                 (1..=14).map(|c| (0xFF, c * 0x11)).collect(),
             )),
-            (Location::Suffix, What::Exact(ts)) => Some((
+            (Location::Suffix, What::Exact(ts)) => Some(KernelFilter::Byte(
                 FilterByte::Last,
                 ts.iter()
                     .map(|(_, nibs)| {
@@ -482,10 +488,13 @@ impl Target {
                     })
                     .collect(),
             )),
-            (Location::Suffix, What::Run(n)) if *n >= 2 => Some((
+            (Location::Suffix, What::Run(n)) if *n >= 2 => Some(KernelFilter::Byte(
                 FilterByte::Last,
                 (0..=15).map(|c| (0x7F, ((c & 7) << 4) | c)).collect(),
             )),
+            (Location::Anywhere, What::Run(n)) if *n >= 7 => {
+                Some(KernelFilter::RunBytes(((*n - 1) / 2).min(3) as u8))
+            }
             _ => None,
         }
     }
@@ -758,8 +767,8 @@ fn spawn_cpu_worker(
         // chain otherwise.
         #[cfg(target_arch = "x86_64")]
         {
-            if CHAIN_BATCH % 8 == 0 && std::is_x86_feature_detected!("avx512f") {
-                // SAFETY: guarded by the runtime avx512f check.
+            if CHAIN_BATCH % 8 == 0 && crate::simd4::avx512_ok() {
+                // SAFETY: guarded by the runtime avx512f+bw check.
                 unsafe { cpu_worker_simd512(&target, &stop, &attempts, &sink) };
                 return;
             }
@@ -891,7 +900,7 @@ unsafe fn cpu_worker_simd(
     let mut local_count: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        let f = filter.as_ref().map(|(b, v)| (*b, v.as_slice()));
+        let f = filter.as_ref();
         p4 = avx2::chain_y_only::<K>(p4, &niels, f, &mut out);
 
         for s in 0..K {
@@ -938,7 +947,7 @@ unsafe fn cpu_worker_simd(
 /// AVX-512 worker: eight independent `+8B` chains in 8 SIMD lanes. Same shape
 /// as [`cpu_worker_simd`], doubled lane count.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn cpu_worker_simd512(
     target: &Target,
     stop: &AtomicBool,
@@ -976,7 +985,7 @@ unsafe fn cpu_worker_simd512(
     let mut local_count: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        let f = filter.as_ref().map(|(b, v)| (*b, v.as_slice()));
+        let f = filter.as_ref();
         p8 = avx512::chain_y_only::<K>(p8, &niels, f, &mut out);
 
         for s in 0..K {
@@ -1219,7 +1228,7 @@ mod tests {
     /// simply finding a different key.
     #[test]
     fn kernel_filter_soundness() {
-        use crate::simd4::FilterByte;
+        use crate::simd4::{FilterByte, KernelFilter};
         fn filter_byte(true_key: &[u8; 32], byte: FilterByte) -> u8 {
             match byte {
                 FilterByte::First => true_key[0],
@@ -1251,7 +1260,7 @@ mod tests {
                 let pat: String = nibs.iter().map(|n| format!("{:X}", n)).collect();
                 for (loc, at) in [(Location::Prefix, 0usize), (Location::Suffix, 64 - len)] {
                     let t = Target::exact(loc, &[pat.clone()]);
-                    let Some((byte, pairs)) = t.kernel_filter() else {
+                    let Some(KernelFilter::Byte(byte, pairs)) = t.kernel_filter() else {
                         continue;
                     };
                     for sign in [0u8, 0x80] {
@@ -1283,7 +1292,7 @@ mod tests {
             for c in 0u8..=15 {
                 for loc in [Location::Prefix, Location::Suffix] {
                     let t = Target::run(loc, n);
-                    let Some((byte, pairs)) = t.kernel_filter() else {
+                    let Some(KernelFilter::Byte(byte, pairs)) = t.kernel_filter() else {
                         continue;
                     };
                     for sign in [0u8, 0x80] {
@@ -1310,6 +1319,59 @@ mod tests {
                         assert!(
                             accepts(&pairs, filter_byte(&key, byte)),
                             "filter rejected a real {loc:?} run: n={n} c={c:X} sign={sign:02X} key={}",
+                            hex::encode_upper(key),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Soundness of the anywhere-run kernel prefilter: every key whose true
+    /// (sign-restored) encoding contains a run of >= n hex chars must pass
+    /// the RunBytes byte-condition on its y-only encoding, for every run
+    /// char, every position (including runs ending at char 63 and crossing
+    /// the sign nibble), and both sign-bit values. A violation silently
+    /// drops real matches in the kernel.
+    #[test]
+    fn kernel_run_filter_soundness() {
+        use crate::simd4::{run_bytes_accept, KernelFilter};
+        let mut st = 0x9a8b_7c6d_5e4f_3a2bu64;
+        let mut rnd = || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (st >> 33) as u8
+        };
+        for n in 7u32..=12 {
+            let t = Target::run(Location::Anywhere, n);
+            let Some(KernelFilter::RunBytes(m)) = t.kernel_filter() else {
+                panic!("anywhere-run n={n} must produce a RunBytes filter");
+            };
+            for start in 0..=(64 - n as usize) {
+                for c in 0u8..=15 {
+                    for sign in [0u8, 0x80] {
+                        let mut key = [0u8; 32];
+                        for b in key.iter_mut() {
+                            *b = rnd();
+                        }
+                        for pos in start..start + n as usize {
+                            let by = &mut key[pos / 2];
+                            if pos % 2 == 0 {
+                                *by = (*by & 0x0F) | (c << 4);
+                            } else {
+                                *by = (*by & 0xF0) | c;
+                            }
+                        }
+                        key[31] = (key[31] & 0x7F) | sign;
+                        // The sign bit may have broken the planted run at
+                        // char 62; then this key genuinely may not match.
+                        if t.authoritative(&key).is_none() {
+                            continue;
+                        }
+                        let mut yonly = key;
+                        yonly[31] &= 0x7F;
+                        assert!(
+                            run_bytes_accept(&yonly, m),
+                            "RunBytes({m}) rejected real run n={n} c={c:X} start={start} sign={sign:02X} key={}",
                             hex::encode_upper(key),
                         );
                     }
@@ -1652,6 +1714,14 @@ mod tests {
                 Target::run(Location::Anywhere, 4),
                 Box::new(|pk: &str| {
                     pk.as_bytes().windows(4).any(|w| w.iter().all(|&c| c == w[0]))
+                }),
+            ),
+            // n = 7 turns on the RunBytes kernel prefilter — an unsound
+            // filter would hang this search.
+            (
+                Target::run(Location::Anywhere, 7),
+                Box::new(|pk: &str| {
+                    pk.as_bytes().windows(7).any(|w| w.iter().all(|&c| c == w[0]))
                 }),
             ),
         ];
