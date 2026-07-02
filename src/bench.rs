@@ -29,9 +29,6 @@ const SCHEMA_VERSION: u32 = 2;
 /// loop the real search uses.
 const CHAIN_BATCH: usize = 1024;
 
-/// Mirrors `CHAIN_BATCH_AVX2` in src/search.rs (see the L2-sizing note there).
-const CHAIN_BATCH_AVX2: usize = 512;
-
 /// Per-worker flush threshold for atomic counter updates. Keeping it batched
 /// avoids dominating the loop with cache-line contention at >1 MH/s.
 const FLUSH_EVERY: u64 = 1024;
@@ -235,7 +232,7 @@ fn spawn_cpu_bench_worker(
                 unsafe { bench_worker_simd512(&matchers, &stop, &keys, &matches) };
                 return;
             }
-            if CHAIN_BATCH_AVX2 % 4 == 0 && std::is_x86_feature_detected!("avx2") {
+            if CHAIN_BATCH % 4 == 0 && std::is_x86_feature_detected!("avx2") {
                 // SAFETY: guarded by the runtime avx2 check.
                 unsafe { bench_worker_simd(&matchers, &stop, &keys, &matches) };
                 return;
@@ -304,7 +301,7 @@ unsafe fn bench_worker_simd(
 ) {
     use crate::simd4::{avx2, fe_frombytes};
 
-    const K: usize = CHAIN_BATCH_AVX2 / 4;
+    const K: usize = CHAIN_BATCH / 4;
 
 
     let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
@@ -347,7 +344,7 @@ unsafe fn bench_worker_simd(
             }
         }
 
-        local_keys += CHAIN_BATCH_AVX2 as u64;
+        local_keys += CHAIN_BATCH as u64;
         if local_keys >= FLUSH_EVERY {
             keys.fetch_add(local_keys, Ordering::Relaxed);
             if local_matches > 0 {

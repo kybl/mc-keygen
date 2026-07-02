@@ -740,19 +740,14 @@ impl SearchHandle {
 /// Xeon; 2048 is flat-to-negative while doubling the working set (the SIMD
 /// workers hold 3 Fe8 arrays of K = CHAIN_BATCH/8 entries, ~240 KB at 1024),
 /// so 1024 sits at the knee of the curve.
+///
+/// The same 1024 also holds for the 4-wide AVX2 worker despite its ~272 KB
+/// working set exceeding the 256 KB per-core L2 of Haswell/Broadwell-class
+/// parts: the Montgomery arrays are read as sequential streams, so hardware
+/// prefetch hides the L3 round-trips behind the field arithmetic. Verified
+/// empirically on a Xeon D-1541 — a 512 batch measured the same or slightly
+/// slower there, while costing ~6% on large-L2 cores.
 const CHAIN_BATCH: usize = 1024;
-
-/// Batch size for the 4-wide AVX2 worker (K = CHAIN_BATCH_AVX2/4 chain
-/// steps). Deliberately smaller than the AVX-512 batch: the worker's
-/// per-batch working set is ~1.06 KB per step (three Fe4 Montgomery arrays
-/// at 320 B plus the out slot), and the CPUs that actually take this path
-/// (Haswell/Broadwell/Skylake-client, Xeon D) have only 256 KB of per-core
-/// L2. At 1024 the ~272 KB working set would thrash it; at 512 (~136 KB)
-/// it fits with room for the SMT sibling. Measured on a large-L2 core the
-/// difference is only ~6% the other way, so the cache-safe size wins.
-/// (A runtime K choice via CPUID was tried and rejected: carrying two
-/// monomorphized workers in the binary cost ~6% on the hot loop by itself.)
-const CHAIN_BATCH_AVX2: usize = 512;
 
 /// Spawn one CPU worker thread that scans via a `+8B` chain with
 /// Montgomery batched compression.
@@ -784,7 +779,7 @@ fn spawn_cpu_worker(
                 unsafe { cpu_worker_simd512(&target, &stop, &attempts, &sink) };
                 return;
             }
-            if CHAIN_BATCH_AVX2 % 4 == 0 && std::is_x86_feature_detected!("avx2") {
+            if CHAIN_BATCH % 4 == 0 && std::is_x86_feature_detected!("avx2") {
                 // SAFETY: guarded by the runtime avx2 check above.
                 unsafe { cpu_worker_simd(&target, &stop, &attempts, &sink) };
                 return;
@@ -881,7 +876,7 @@ unsafe fn cpu_worker_simd(
 ) {
     use crate::simd4::{avx2, fe_frombytes};
 
-    const K: usize = CHAIN_BATCH_AVX2 / 4;
+    const K: usize = CHAIN_BATCH / 4;
 
     let eight_b = ED25519_BASEPOINT_TABLE * &Scalar::from(8u64);
     // Each batch advances every lane by K steps of 8B.
@@ -941,7 +936,7 @@ unsafe fn cpu_worker_simd(
             }
         }
 
-        local_count += CHAIN_BATCH_AVX2 as u64;
+        local_count += CHAIN_BATCH as u64;
         if local_count >= BATCH_SIZE {
             attempts.fetch_add(local_count, Ordering::Relaxed);
             local_count = 0;
