@@ -184,6 +184,15 @@ fn format_duration(secs: f64) -> String {
     }
 }
 
+/// Undo everything the TUI did to the terminal. ratatui hides the cursor on
+/// every draw (`?25l`), and that outlives the alternate screen — without an
+/// explicit show, the shell prompt comes back without a cursor.
+fn restore_terminal() -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(stdout(), LeaveAlternateScreen, crossterm::cursor::Show)?;
+    Ok(())
+}
+
 fn run_tui_loop(
     handle: SearchHandle,
     search_desc: &str,
@@ -324,16 +333,14 @@ fn run_tui_loop(
                         && key.modifiers.contains(event::KeyModifiers::CONTROL)
                 {
                     // Restore terminal before exiting
-                    disable_raw_mode()?;
-                    execute!(stdout(), LeaveAlternateScreen)?;
+                    restore_terminal()?;
                     std::process::exit(130);
                 }
             }
         }
     };
 
-    disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen)?;
+    restore_terminal()?;
 
     Ok(result)
 }
