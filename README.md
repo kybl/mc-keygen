@@ -77,6 +77,24 @@ cargo build --release --features metal   # with Apple Metal GPU support
 
 CUDA support requires the NVIDIA CUDA Toolkit. Metal support requires macOS with an Apple Silicon or AMD GPU. See [docs/gpu.md](docs/gpu.md) for details.
 
+### Faster build (PGO)
+
+`./scripts/pgo-build.sh` produces a profile-guided-optimized binary, measured
+**~16% faster** on the search loop than a plain `--release` build. It builds
+an instrumented binary, records a profile from a short run, then rebuilds.
+Run it **on the machine you'll search on** — the profile is specific to the
+SIMD path your CPU takes (AVX-512 / AVX2 / scalar) and doesn't transfer across
+microarchitectures. Requires `rustup component add llvm-tools-preview`.
+
+### Thread count
+
+By default the search uses one worker per logical CPU on homogeneous SMT
+machines (the sibling thread hides field-arithmetic latency, ~+22% on a Xeon
+D-1541), but one per **physical** core on hybrid Intel P+E CPUs, where the
+P-core hyperthreads contend with the E-cores (~−5% on an i7-13700H at 20 vs 14
+threads). Run `mc-keygen bench -m all --machine-label <name>` to find the best
+count for your CPU and pass it with `-t` if the default isn't optimal.
+
 ## How it works
 
 1. Draw 64 random bytes from the OS CSPRNG

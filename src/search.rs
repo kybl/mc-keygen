@@ -62,7 +62,30 @@ pub trait GpuSearcher: Send {
     fn device_name(&self) -> &str;
 }
 
-/// Default CPU worker count for hybrid mode.
+/// Default worker-thread count for a pure-CPU search.
+///
+/// On a homogeneous SMT machine (`logical == 2·physical`), a second thread
+/// per core fills the latency gaps in the field-arithmetic chain and helps:
+/// measured +22% (8→16 threads) on an 8-core Xeon D-1541. On a hybrid Intel
+/// P+E CPU the extra P-core hyperthreads instead contend with the E-cores
+/// and *hurt*: measured -5% (14→20 threads) on an i7-13700H (6P+8E). So use
+/// all logical CPUs only when they're a clean 2× of physical; otherwise use
+/// the physical-core count. Always capped by `available_parallelism`, which
+/// already respects cgroup/affinity limits (containers).
+pub fn default_cpu_threads() -> usize {
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let physical = sysinfo::System::new().physical_core_count().unwrap_or(logical);
+    let chosen = if physical > 0 && logical == 2 * physical {
+        logical // clean SMT: the sibling thread pays off
+    } else {
+        physical // hybrid P+E, or no SMT: one worker per physical core
+    };
+    chosen.clamp(1, logical)
+}
+
+/// Default CPU worker count for hybrid (CPU+GPU) mode.
 ///
 /// Reserves one SMT pair (or one core on non-SMT hardware) per GPU so the
 /// GPU dispatch thread's host work — kernel launch, result copy — isn't
@@ -1554,6 +1577,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn default_cpu_threads_is_sane() {
+        let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let t = default_cpu_threads();
+        assert!(t >= 1 && t <= logical, "picked {t} threads, logical={logical}");
     }
 
     #[test]

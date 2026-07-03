@@ -541,11 +541,7 @@ fn main() {
     // Run-forever streaming mode: CPU-only, no TUI. Print every match to
     // stdout as it's found and keep going until the process is killed.
     if cli.stream {
-        let num_threads = cli.threads.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        });
+        let num_threads = cli.threads.unwrap_or_else(search::default_cpu_threads);
         run_stream(Arc::clone(&target), num_threads, &search_desc, cli.json);
         return;
     }
@@ -590,15 +586,13 @@ fn main() {
         _ => vec![],
     };
 
-    // Hybrid mode reserves cores for the GPU dispatch thread; pure-CPU uses
-    // all logical cores. Explicit -t overrides either default.
+    // Hybrid mode reserves cores for the GPU dispatch thread; pure-CPU picks
+    // a thread count from the SMT/hybrid topology. Explicit -t overrides either.
     let num_threads = cli.threads.unwrap_or_else(|| {
         if !gpu_searchers.is_empty() && !gpu_only {
             search::default_hybrid_cpu_threads(gpu_searchers.len())
         } else {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
+            search::default_cpu_threads()
         }
     });
 
