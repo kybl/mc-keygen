@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 #
-# Profile-guided optimization build. Measured ~16% faster than a plain
-# --release build on the hot search loop.
+# Profile-guided optimization build. The effect is MICROARCHITECTURE-
+# SPECIFIC and can go either way: measured +16% on an Ice Lake-class
+# AVX-512 machine, but -8% on a Broadwell Xeon D-1541 (AVX2 path).
+# The script therefore benchmarks plain vs PGO at the end and tells you
+# which one won — only deploy the PGO binary if it actually wins here.
 #
 # PGO is a two-phase build: compile an instrumented binary, run it on a
 # representative workload to record a profile, then recompile using that
-# profile. The profile MUST be gathered on the same CPU family you'll run
-# on (the profile captures the code path your CPU actually takes — AVX-512
-# vs AVX2 vs scalar — so a profile from one machine does not transfer to a
-# different microarchitecture). Just run this script on the target machine.
+# profile. Run this script on the machine you'll search on.
 #
 # Usage:  ./scripts/pgo-build.sh [seconds_per_mode]
-# Output: ./target/release/mc-keygen  (PGO-optimized)
+# Output: ./target/release/mc-keygen        (plain --release)
+#         ./target/release/mc-keygen-pgo    (PGO build)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -44,5 +45,28 @@ timeout "$SECS" "$BIN" DEAD --where suffix --stream  >/dev/null 2>&1 || true
 
 echo "==> [3/3] rebuilding with profile"
 RUSTFLAGS="-Cprofile-use=$PGO_DIR/merged.profdata" cargo build --release --quiet
+cp ./target/release/mc-keygen ./target/release/mc-keygen-pgo
 
-echo "Done: ./target/release/mc-keygen (PGO)"
+# Rebuild plain for an apples-to-apples comparison on THIS machine.
+cargo build --release --quiet
+
+rate() { # print keys/s of one bench cpu1 run
+  "$1" bench -m cpu1 -d "$SECS" -p abc --machine-label pgo-ab 2>/dev/null \
+    | grep -o '"rate_keys_per_sec":[0-9.]*' | cut -d: -f2
+}
+echo "==> comparing plain vs PGO on this machine (cpu1, ${SECS}s each)"
+PLAIN=$(rate ./target/release/mc-keygen)
+PGO=$(rate ./target/release/mc-keygen-pgo)
+python3 - "$PLAIN" "$PGO" << 'PYEOF'
+import sys
+plain, pgo = float(sys.argv[1]), float(sys.argv[2])
+delta = (pgo / plain - 1) * 100
+print(f"    plain: {plain/1e6:.2f} MH/s")
+print(f"    pgo:   {pgo/1e6:.2f} MH/s   ({delta:+.1f}%)")
+if pgo > plain * 1.02:
+    print("==> PGO wins here: use ./target/release/mc-keygen-pgo")
+elif pgo < plain * 0.98:
+    print("==> PGO LOSES on this CPU: keep the plain ./target/release/mc-keygen")
+else:
+    print("==> No significant difference: keep the plain binary")
+PYEOF

@@ -62,27 +62,19 @@ pub trait GpuSearcher: Send {
     fn device_name(&self) -> &str;
 }
 
-/// Default worker-thread count for a pure-CPU search.
+/// Default worker-thread count for a pure-CPU search: every logical CPU.
 ///
-/// On a homogeneous SMT machine (`logical == 2·physical`), a second thread
-/// per core fills the latency gaps in the field-arithmetic chain and helps:
-/// measured +22% (8→16 threads) on an 8-core Xeon D-1541. On a hybrid Intel
-/// P+E CPU the extra P-core hyperthreads instead contend with the E-cores
-/// and *hurt*: measured -5% (14→20 threads) on an i7-13700H (6P+8E). So use
-/// all logical CPUs only when they're a clean 2× of physical; otherwise use
-/// the physical-core count. Always capped by `available_parallelism`, which
-/// already respects cgroup/affinity limits (containers).
+/// On a homogeneous SMT machine the sibling thread hides field-arithmetic
+/// latency and clearly helps (measured +22%, 8 -> 16 threads, on a Xeon
+/// D-1541). On hybrid Intel P+E parts the picture is unclear — the one
+/// measurement suggesting physical-only was faster (i7-13700H) turned out
+/// to be contaminated by an unrelated 100%-CPU process, so until a clean
+/// measurement says otherwise, stick with the simple all-logical default;
+/// `-t` overrides it and `bench -m all` compares cpu-p vs cpu-n per machine.
 pub fn default_cpu_threads() -> usize {
-    let logical = std::thread::available_parallelism()
+    std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(1);
-    let physical = sysinfo::System::new().physical_core_count().unwrap_or(logical);
-    let chosen = if physical > 0 && logical == 2 * physical {
-        logical // clean SMT: the sibling thread pays off
-    } else {
-        physical // hybrid P+E, or no SMT: one worker per physical core
-    };
-    chosen.clamp(1, logical)
+        .unwrap_or(1)
 }
 
 /// Default CPU worker count for hybrid (CPU+GPU) mode.

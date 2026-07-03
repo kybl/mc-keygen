@@ -77,23 +77,24 @@ cargo build --release --features metal   # with Apple Metal GPU support
 
 CUDA support requires the NVIDIA CUDA Toolkit. Metal support requires macOS with an Apple Silicon or AMD GPU. See [docs/gpu.md](docs/gpu.md) for details.
 
-### Faster build (PGO)
+### PGO build (measure before trusting it)
 
-`./scripts/pgo-build.sh` produces a profile-guided-optimized binary, measured
-**~16% faster** on the search loop than a plain `--release` build. It builds
-an instrumented binary, records a profile from a short run, then rebuilds.
-Run it **on the machine you'll search on** — the profile is specific to the
-SIMD path your CPU takes (AVX-512 / AVX2 / scalar) and doesn't transfer across
-microarchitectures. Requires `rustup component add llvm-tools-preview`.
+`./scripts/pgo-build.sh` produces a profile-guided-optimized binary. The
+effect is **microarchitecture-specific and can go either way**: measured
+**+16%** on an Ice Lake-class AVX-512 machine but **−8%** on a Broadwell
+Xeon D-1541 (AVX2 path) — code-layout changes that help one CPU hurt
+another. Build it on the target machine, compare against the plain
+`--release` binary with `bench -m cpu1`, and keep whichever wins there.
+Requires `rustup component add llvm-tools-preview`.
 
 ### Thread count
 
-By default the search uses one worker per logical CPU on homogeneous SMT
-machines (the sibling thread hides field-arithmetic latency, ~+22% on a Xeon
-D-1541), but one per **physical** core on hybrid Intel P+E CPUs, where the
-P-core hyperthreads contend with the E-cores (~−5% on an i7-13700H at 20 vs 14
-threads). Run `mc-keygen bench -m all --machine-label <name>` to find the best
-count for your CPU and pass it with `-t` if the default isn't optimal.
+The default is one worker per logical CPU. On homogeneous SMT machines the
+sibling thread hides field-arithmetic latency and helps (~+22% on a Xeon
+D-1541). On hybrid Intel P+E CPUs the optimum may differ — run
+`mc-keygen bench -m all --machine-label <name>` on an otherwise idle machine
+to compare the physical-core (`cpuP`) and all-logical (`cpuN`) rates, and
+pass the winner with `-t` if it isn't the default.
 
 ## How it works
 
