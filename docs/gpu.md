@@ -2,16 +2,20 @@
 
 ## Performance
 
-### NOTE: as of 5/11 these numbers are out of date
-
 Measured throughput on real hardware:
 
 | | Throughput | Hardware |
 |-|------------|----------|
-| **CPU** | ~1.3M keys/sec | AMD Ryzen 9 7950X3D (32 threads) |
+| **CPU** | ~24M keys/sec | Xeon D-1541, 8C/16T, AVX2 path |
+| **CPU** | ~34M keys/sec | 4-core Ice-Lake-class VM, AVX-512 path |
 | **GPU** | ~68M keys/sec | NVIDIA RTX 4090 (24GB) |
 
-The GPU is roughly **50x faster** than the CPU on this hardware. The speedup comes from running the full Ed25519 pipeline across thousands of GPU threads in parallel.
+The GPU speedup comes from running the full Ed25519 pipeline across thousands
+of GPU threads in parallel. Note the CPU path has been heavily optimized
+since the GPU numbers were taken (SIMD-across-keys, batched inversion, kernel
+prefilters — see [benchmarks.md](benchmarks.md)), so the gap on this pairing
+is now roughly 2–3× rather than the historical ~50×; the GPU kernel has not
+received the same optimization pass.
 
 ## Building with CUDA
 
