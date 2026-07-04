@@ -4,12 +4,25 @@ Vanity Ed25519 key generator for [MeshCore](https://github.com/ripplebiz/MeshCor
 
 > **CPU-optimized fork** of the original `mc-keygen` by Sam Schlegel
 > (upstream: `<add repo URL>`).
-> The CPU search loop has been rewritten for **~5× higher throughput** (on an
-> AVX-512 machine; ~3× on an AVX2-only CPU) — a `+8B` point-addition chain,
-> Montgomery batched inversion, y-only compression, SIMD-across-keys (AVX-512 /
-> AVX2), and kernel prefilters — plus new search modes (match anywhere / as a
-> suffix / runs of repeated characters) and a run-forever `--stream` mode.
-> See [docs/benchmarks.md](docs/benchmarks.md) for measured numbers.
+
+### What's new in this fork
+
+- **~5× faster CPU search** (on an AVX-512 machine; ~3× on an AVX2-only CPU).
+  The search loop was rewritten: a `+8B` point-addition chain instead of a
+  full scalar-multiply per key, Montgomery batched inversion, y-only
+  compression, SIMD-across-keys (runtime AVX-512 / AVX2 / scalar dispatch),
+  and vectorized kernel prefilters. See [docs/benchmarks.md](docs/benchmarks.md).
+- **`--where` — match position:** `prefix` (default), `anywhere`, or `suffix`.
+- **`--run N` — repeated-character search:** find a run of at least N identical
+  hex characters (combine with `--where`, e.g. `--run 12 --where anywhere`).
+- **`--stream` — run forever:** print every match to stdout and keep going,
+  for leaving a long search on a server and collecting all hits later.
+- **Bug fix:** the TUI now restores the terminal cursor on exit.
+- **Correctness:** every soundness-critical prefilter is covered by
+  differential and mutation-verified property tests.
+
+The original prefix search, JSON output, TUI, and CUDA/Metal GPU support are
+all unchanged.
 
 ## Usage
 
