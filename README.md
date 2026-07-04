@@ -2,8 +2,7 @@
 
 Vanity Ed25519 key generator for [MeshCore](https://github.com/ripplebiz/MeshCore). Find keys whose public key contains a chosen hex pattern — at the start, at the end, or anywhere — or a run of repeated hex characters.
 
-> **CPU-optimized fork** of the original `mc-keygen` by Sam Schlegel
-> (upstream: `<add repo URL>`).
+> **CPU-optimized fork** of [samschlegel/mc-keygen](https://github.com/samschlegel/mc-keygen) by Sam Schlegel.
 
 ### What's new in this fork
 
